@@ -1,6 +1,6 @@
 # OctopusEAX
 
-Voice effects for Discord and games on Windows. OctopusEAX puts your voice in a room, changes how it sounds, cleans up the noise around you and plays sounds into your mic.
+Free and open-source voice effects for Discord and games on Windows. OctopusEAX puts your voice in a room, changes how it sounds, cleans up the noise around you and plays sounds into your mic.
 
 - 15 echo rooms, from Bathroom to Haunted Cavern
 - 42 voice masks, pitch, size and speed
@@ -19,10 +19,10 @@ Voice effects for Discord and games on Windows. OctopusEAX puts your voice in a 
 
 ## Getting started
 
-1. Open OctopusEAX. The first time, it asks for a key: copy your machine number, send it to us on [Discord](https://discord.gg/4xhsX9Cn7e), then paste the key you get back and press **Activate**.
+1. Open OctopusEAX. The first time, it shows your machine number. Send it on our [Discord](https://discord.gg/4xhsX9Cn7e) and you get a free key for that PC. Paste the key and press **Activate**.
 2. Pick your microphone and your speakers or headphones at the top left.
-3. In Discord or your game, choose the mic shown at the bottom of the window, **What U Hear (VB-Audio Virtual Cable)**, as your input device.
-4. Pick a room and raise **Effects amount**. Tick **Hear myself** if you want to hear the result.
+3. In Discord or your game, set your input device to the mic shown at the bottom of the window, **What U Hear (VB-Audio Virtual Cable)**.
+4. Pick a room and raise **Effects amount**. Tick **Hear myself** to hear the result.
 
 Rest the mouse on any control and a short hint tells you what it does.
 
