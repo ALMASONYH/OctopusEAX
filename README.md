@@ -17,9 +17,10 @@ Free and open-source voice effects for Discord and games on Windows. OctopusEAX 
 - A microphone
 - VB-Audio Virtual Cable (free). OctopusEAX offers to set it up the first time you open it.
 
+
 ## Getting started
 
-1. Open OctopusEAX. The first time, it shows your machine number. Send it on our [Discord](https://discord.gg/4xhsX9Cn7e) and you get a free key for that PC. Paste the key and press **Activate**.
+1. Open OctopusEAX. The first time, it asks for a key made for this PC. Paste the key and press **Activate**. [The key generator](#the-key-generator) explains how keys are made.
 2. Pick your microphone and your speakers or headphones at the top left.
 3. In Discord or your game, set your input device to the mic shown at the bottom of the window, **What U Hear (VB-Audio Virtual Cable)**.
 4. Pick a room and raise **Effects amount**. Tick **Hear myself** to hear the result.
@@ -130,7 +131,9 @@ Hotkeys work in every program, even inside games. Click a key box and press the 
 1. Install Visual Studio 2026 with the **Desktop development with C++** workload.
 2. Open `MasonEAX.sln`.
 3. Choose **Release** and **x64**, then build.
-4. The program is `build\MasonEAX\OctopusEAX.exe`.
+4. The program is `build\MasonEAX\OctopusEAX.exe`. The tools land in `build\tools`, except MasonIR, which goes next to the program.
+
+The two projects under **KeyGen** in the solution need `tools\keygen\keygen_secret.inc`, the private file that signs keys. It is not part of this source, so building the solution skips those two projects. They build only with that file in `tools\keygen`.
 
 | Folder | What is in it |
 | --- | --- |
@@ -143,4 +146,46 @@ Hotkeys work in every program, even inside games. Click a key box and press the 
 | `src/mixing`, `src/convolution`, `src/audio` | Levels, mixing and audio buffers |
 | `src/cable` | VB-Audio Virtual Cable setup |
 | `src/licensing` | The key check |
-| `res` | The icon and the pictures |
+| `res` | The icons and the pictures |
+| `tools` | Command-line tools used to tune the rooms: turn a sound file into WAV, measure a sound card's room, compare recordings, and run a voice through a room into a WAV file |
+| `tools/keygen` | The key generator, and the tool that makes its secret file |
+
+## The key generator
+
+`tools/keygen` holds the two programs that make OctopusEAX keys: the key generator itself (the MasonKeygen project, built as `OctopusKeygen.exe`) and MakeSecret. They need `keygen_secret.inc`, which is not part of this source, so they don't build from it alone.
+
+### How keys work
+
+- Every PC has a machine number made from its hardware: 16 characters, like `ABCD-EFGH-IJKL-MNOP`. OctopusEAX shows it on its activation screen.
+- A key is a digital signature (ECDSA P-256, made with Windows BCrypt) over that machine number, an end date and a few options. It only works on the PC it was made for.
+- OctopusEAX holds only the public half of the signing key, in `src/licensing/vendor_key.inc`. It can check a key but can't make one. The check is in `src/licensing/license.hpp`.
+- The private half is in `tools/keygen/keygen_secret.inc`, sealed so the key generator opens it only on the PCs it was made for.
+- A timed key ends on its end date. OctopusEAX keeps track of the date it has seen, so turning the PC's clock back doesn't bring an ended key back.
+
+### Making a key
+
+The **New key** side:
+
+1. Type who the key is for under **Customer name**. The name is only saved on this PC.
+2. Paste their **Machine number**.
+3. Under **Membership**, pick **7 days**, **30 days**, **1 year** or **Lifetime**, or pick **Custom** and set the days, hours and minutes.
+4. Press **Generate key**. The key appears under **Key**. **Copy key** copies it so you can send it.
+
+On their PC, they paste the key into OctopusEAX and press **Activate**.
+
+### Giving more time
+
+The **Customers** side lists every key made on this PC, with its status: active, expired or lifetime. Pick someone and press **7 days**, **30 days** or **Custom** to make them a new key with that much more time. The new key is copied for you. The list is kept in `octopus_history.txt` next to the key generator.
+
+### Where it works
+
+The line at the bottom says **Locked to this PC** when the key generator can open its secret here. On any other PC, it says **This key generator doesn't work on this PC** and shows that PC's machine number instead.
+
+### MakeSecret
+
+MakeSecret is a command-line tool that makes `keygen_secret.inc`.
+
+- `MakeSecret <machine numbers...>` makes a new signing key, locks it to those PCs and writes `keygen_secret.inc`. It then prints the public key to put in a free slot of `src/licensing/vendor_key.inc`, and the new check tables for `src/licensing/license.hpp`. Rebuild OctopusEAX and the key generator after that.
+- `MakeSecret --reseal <file> [--code <recovery code>] [machine numbers...]` keeps the same signing key but locks it to other PCs. It writes `keygen_secret.new.inc` and puts a recovery code in `<file>`. Keys already sent out keep working. On a new PC, run it with `--code` and the recovery code, then rebuild the key generator.
+
+Keep `keygen_secret.inc` and the recovery code private. Anyone who has them can make keys.
