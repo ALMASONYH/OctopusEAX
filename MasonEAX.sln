@@ -1,0 +1,74 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 18
+VisualStudioVersion = 18.9.12120.119
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "MasonEAX", "src\MasonEAX.vcxproj", "{6D2C0F51-7B8E-4A3B-9E1F-2C5D8A4B7E10}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Tools", "Tools", "{5E7D9C1B-3A2F-4D6E-9B8C-7A6F5E4D3C2B}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "MasonIR", "tools\MasonIR.vcxproj", "{A3F19C7E-52D4-4B6A-8C0E-1F7B93D2E645}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "MasonRender", "tools\MasonRender.vcxproj", "{B7D2E4F6-1A3C-4E5B-9D8F-6C7A2B4E1F93}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "MasonMeter", "tools\MasonMeter.vcxproj", "{E3A9C1D5-7B2F-4D6E-8A4C-2F1B9E7D3C58}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "MasonDecode", "tools\MasonDecode.vcxproj", "{9D4B6E2A-3C7F-4A1D-B5E8-6F0C2D9A7B31}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "KeyGen", "KeyGen", "{9C3B7A5E-1D2F-4E8A-B6C4-D5E6F7A8B9C0}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "MasonKeygen", "tools\keygen\MasonKeygen.vcxproj", "{F1A2B3C4-D5E6-4F70-8192-A3B4C5D6E7F8}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "MakeSecret", "tools\keygen\MakeSecret.vcxproj", "{0B9E8D7C-6A5F-4E4D-8C3B-2A1F0E9D8C7B}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution Items", "{F7496166-13EB-58A9-8575-5207ECF9615D}"
+	ProjectSection(SolutionItems) = preProject
+		Build.props = Build.props
+	EndProjectSection
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{6D2C0F51-7B8E-4A3B-9E1F-2C5D8A4B7E10}.Debug|x64.ActiveCfg = Debug|x64
+		{6D2C0F51-7B8E-4A3B-9E1F-2C5D8A4B7E10}.Debug|x64.Build.0 = Debug|x64
+		{6D2C0F51-7B8E-4A3B-9E1F-2C5D8A4B7E10}.Release|x64.ActiveCfg = Release|x64
+		{6D2C0F51-7B8E-4A3B-9E1F-2C5D8A4B7E10}.Release|x64.Build.0 = Release|x64
+		{A3F19C7E-52D4-4B6A-8C0E-1F7B93D2E645}.Debug|x64.ActiveCfg = Debug|x64
+		{A3F19C7E-52D4-4B6A-8C0E-1F7B93D2E645}.Debug|x64.Build.0 = Debug|x64
+		{A3F19C7E-52D4-4B6A-8C0E-1F7B93D2E645}.Release|x64.ActiveCfg = Release|x64
+		{A3F19C7E-52D4-4B6A-8C0E-1F7B93D2E645}.Release|x64.Build.0 = Release|x64
+		{F1A2B3C4-D5E6-4F70-8192-A3B4C5D6E7F8}.Debug|x64.ActiveCfg = Debug|x64
+		{F1A2B3C4-D5E6-4F70-8192-A3B4C5D6E7F8}.Release|x64.ActiveCfg = Release|x64
+		{0B9E8D7C-6A5F-4E4D-8C3B-2A1F0E9D8C7B}.Debug|x64.ActiveCfg = Debug|x64
+		{0B9E8D7C-6A5F-4E4D-8C3B-2A1F0E9D8C7B}.Release|x64.ActiveCfg = Release|x64
+		{B7D2E4F6-1A3C-4E5B-9D8F-6C7A2B4E1F93}.Debug|x64.ActiveCfg = Debug|x64
+		{B7D2E4F6-1A3C-4E5B-9D8F-6C7A2B4E1F93}.Debug|x64.Build.0 = Debug|x64
+		{B7D2E4F6-1A3C-4E5B-9D8F-6C7A2B4E1F93}.Release|x64.ActiveCfg = Release|x64
+		{B7D2E4F6-1A3C-4E5B-9D8F-6C7A2B4E1F93}.Release|x64.Build.0 = Release|x64
+		{E3A9C1D5-7B2F-4D6E-8A4C-2F1B9E7D3C58}.Debug|x64.ActiveCfg = Debug|x64
+		{E3A9C1D5-7B2F-4D6E-8A4C-2F1B9E7D3C58}.Debug|x64.Build.0 = Debug|x64
+		{E3A9C1D5-7B2F-4D6E-8A4C-2F1B9E7D3C58}.Release|x64.ActiveCfg = Release|x64
+		{E3A9C1D5-7B2F-4D6E-8A4C-2F1B9E7D3C58}.Release|x64.Build.0 = Release|x64
+		{9D4B6E2A-3C7F-4A1D-B5E8-6F0C2D9A7B31}.Debug|x64.ActiveCfg = Debug|x64
+		{9D4B6E2A-3C7F-4A1D-B5E8-6F0C2D9A7B31}.Debug|x64.Build.0 = Debug|x64
+		{9D4B6E2A-3C7F-4A1D-B5E8-6F0C2D9A7B31}.Release|x64.ActiveCfg = Release|x64
+		{9D4B6E2A-3C7F-4A1D-B5E8-6F0C2D9A7B31}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{B7D2E4F6-1A3C-4E5B-9D8F-6C7A2B4E1F93} = {5E7D9C1B-3A2F-4D6E-9B8C-7A6F5E4D3C2B}
+		{E3A9C1D5-7B2F-4D6E-8A4C-2F1B9E7D3C58} = {5E7D9C1B-3A2F-4D6E-9B8C-7A6F5E4D3C2B}
+		{9D4B6E2A-3C7F-4A1D-B5E8-6F0C2D9A7B31} = {5E7D9C1B-3A2F-4D6E-9B8C-7A6F5E4D3C2B}
+		{A3F19C7E-52D4-4B6A-8C0E-1F7B93D2E645} = {5E7D9C1B-3A2F-4D6E-9B8C-7A6F5E4D3C2B}
+		{F1A2B3C4-D5E6-4F70-8192-A3B4C5D6E7F8} = {9C3B7A5E-1D2F-4E8A-B6C4-D5E6F7A8B9C0}
+		{0B9E8D7C-6A5F-4E4D-8C3B-2A1F0E9D8C7B} = {9C3B7A5E-1D2F-4E8A-B6C4-D5E6F7A8B9C0}
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {D4E5F6A7-B8C9-4D0E-9F1A-2B3C4D5E6F70}
+	EndGlobalSection
+EndGlobal
