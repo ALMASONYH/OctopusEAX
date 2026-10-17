@@ -1,0 +1,116 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{6D2C0F51-7B8E-4A3B-9E1F-2C5D8A4B7E10}</ProjectGuid>
+    <RootNamespace>MasonEAX</RootNamespace>
+    <Keyword>Win32Proj</Keyword>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>NotSet</CharacterSet>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="..\Build.props" />
+  </ImportGroup>
+  <PropertyGroup>
+    <OutDir>$(OutRoot)MasonEAX\</OutDir>
+    <TargetName>OctopusEAX</TargetName>
+    <GenerateManifest>false</GenerateManifest>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <AdditionalDependencies>ole32.lib;uuid.lib;comctl32.lib;shell32.lib;advapi32.lib;gdi32.lib;gdiplus.lib;msimg32.lib;bcrypt.lib;uxtheme.lib;mf.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;urlmon.lib;wininet.lib;winmm.lib;comdlg32.lib;avrt.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>mf.dll;mfplat.dll;mfreadwrite.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="app.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="audio\fixed_ring.hpp" />
+    <ClInclude Include="audio\render_feed.hpp" />
+    <ClInclude Include="cable\cable_package.hpp" />
+    <ClInclude Include="convolution\convolution_reverb.hpp" />
+    <ClInclude Include="convolution\fft.hpp" />
+    <ClInclude Include="convolution\partition.hpp" />
+    <ClInclude Include="equalizer\bass_boost.hpp" />
+    <ClInclude Include="equalizer\biquad.hpp" />
+    <ClInclude Include="equalizer\eq_config.hpp" />
+    <ClInclude Include="equalizer\eq_presets.hpp" />
+    <ClInclude Include="equalizer\filter_design.hpp" />
+    <ClInclude Include="equalizer\graphic_equalizer.hpp" />
+    <ClInclude Include="isolation\expander_gate.hpp" />
+    <ClInclude Include="isolation\voice_isolator.hpp" />
+    <ClInclude Include="licensing\hardware_id.hpp" />
+    <ClInclude Include="licensing\license.hpp" />
+    <ClInclude Include="mixing\amount_law.hpp" />
+    <ClInclude Include="mixing\cmss3d.hpp" />
+    <ClInclude Include="mixing\echo_tap.hpp" />
+    <ClInclude Include="mixing\mic_drive.hpp" />
+    <ClInclude Include="mixing\mic_tone.hpp" />
+    <ClInclude Include="mixing\out_chain.hpp" />
+    <ClInclude Include="mixing\send_level.hpp" />
+    <ClInclude Include="mixing\soft_clip.hpp" />
+    <ClInclude Include="mixing\step_back.hpp" />
+    <ClInclude Include="mixing\subsonic.hpp" />
+    <ClInclude Include="mixing\wet_peak.hpp" />
+    <ClInclude Include="playback\clip_util.hpp" />
+    <ClInclude Include="playback\hear_tap.hpp" />
+    <ClInclude Include="playback\player.hpp" />
+    <ClInclude Include="playback\program_tap.hpp" />
+    <ClInclude Include="playback\recorder.hpp" />
+    <ClInclude Include="playback\sound_board.hpp" />
+    <ClInclude Include="playback\sound_convert.hpp" />
+    <ClInclude Include="playback\sound_edit.hpp" />
+    <ClInclude Include="playback\sound_save.hpp" />
+    <ClInclude Include="presets\card_presets.hpp" />
+    <ClInclude Include="reverb\biquad.hpp" />
+    <ClInclude Include="reverb\card_core.hpp" />
+    <ClInclude Include="reverb\delay_bank.hpp" />
+    <ClInclude Include="reverb\reverb_engine.hpp" />
+    <ClInclude Include="reverb\reverb_params.hpp" />
+    <ClInclude Include="ui\font_file.hpp" />
+    <ClInclude Include="voice\fx_parts.hpp" />
+    <ClInclude Include="voice\glitch_pad.hpp" />
+    <ClInclude Include="voice\glitcher.hpp" />
+    <ClInclude Include="voice\pitch_tracker.hpp" />
+    <ClInclude Include="voice\song_changer.hpp" />
+    <ClInclude Include="voice\song_shifter.hpp" />
+    <ClInclude Include="voice\tempo.hpp" />
+    <ClInclude Include="voice\timbre.hpp" />
+    <ClInclude Include="voice\vocoder.hpp" />
+    <ClInclude Include="voice\voice_fx.hpp" />
+    <ClInclude Include="voice\voice_masks.hpp" />
+    <ClInclude Include="voice\voice_shaper.hpp" />
+    <ClInclude Include="voice\voice_tone.hpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="app.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="app.manifest" />
+    <None Include="licensing\vendor_key.inc" />
+    <None Include="licensing\revoked.inc" />
+    <Image Include="..\res\octopus.ico" />
+    <Image Include="..\res\octopus.png" />
+    <Image Include="..\res\dsaffe.png" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
