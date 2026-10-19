@@ -1688,7 +1688,41 @@ static void flatDc(HDC dc) { ModifyWorldTransform(dc, nullptr, MWT_IDENTITY); }
 
 static HPEN linePen(COLORREF c) { return CreatePen(PS_SOLID, uiScale == floorf(uiScale) ? 1 : 0, c); }
 
-static void frame(HDC dc, int left, int top, int right, int bottom) { Rectangle(dc, left, top, right - 1, bottom - 1); }
+
+struct PixelSnap {
+    HDC dc;
+    XFORM keep{1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+    bool read = false;
+
+    explicit PixelSnap(HDC d) : dc(d) {
+        read = GetWorldTransform(dc, &keep) != FALSE;
+        if (!read) keep = XFORM{1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+        flatDc(dc);
+    }
+    ~PixelSnap() {
+        if (read) SetWorldTransform(dc, &keep);
+    }
+    PixelSnap(const PixelSnap&) = delete;
+    PixelSnap& operator=(const PixelSnap&) = delete;
+
+    LONG x(float v) const { return lroundf(v * keep.eM11 + keep.eDx); }
+    LONG y(float v) const { return lroundf(v * keep.eM22 + keep.eDy); }
+    RECT map(const RECT& r) const { return {x((float)r.left), y((float)r.top), x((float)r.right), y((float)r.bottom)}; }
+    int line() const { return keep.eM11 >= 1.0f && keep.eM11 == floorf(keep.eM11) ? (int)keep.eM11 : 1; }
+    RECT inside(const RECT& r) const {
+        RECT d = map(r);
+        InflateRect(&d, -line(), -line());
+        return d;
+    }
+};
+
+static void edgeLines(HDC dc, const RECT& d, int t, COLORREF edge) {
+    HBRUSH b = CreateSolidBrush(edge);
+    const RECT sides[4] = {{d.left, d.top, d.right, d.top + t}, {d.left, d.bottom - t, d.right, d.bottom},
+                           {d.left, d.top, d.left + t, d.bottom}, {d.right - t, d.top, d.right, d.bottom}};
+    for (const RECT& side : sides) FillRect(dc, &side, b);
+    DeleteObject(b);
+}
 
 static bool mouseMsg(UINT m) { return m >= WM_MOUSEFIRST && m <= WM_MOUSELAST && m != WM_MOUSEWHEEL && m != WM_MOUSEHWHEEL; }
 
@@ -1712,9 +1746,23 @@ static POINT wheelPoint(HWND h, LPARAM l) {
     return p;
 }
 
+static double fadeBegin(HWND h, UINT m, WPARAM w, LPARAM l);
+static void fadeEnd(double outer);
+static void fadeApply(HWND h, HDC dc, const RECT& paint);
+static void fadeForget(HWND h);
+static void fadeDrop(HWND h);
+static bool hoverWatch(HWND h, UINT m, WPARAM w);
+static void hoverFade(HWND h);
+
 template <LRESULT (CALLBACK *Proc)(HWND, UINT, WPARAM, LPARAM)>
 static LRESULT CALLBACK scaledProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    return Proc(h, m, w, mouseMsg(m) ? designPt(l) : l);
+    if (m == WM_NCDESTROY) fadeForget(h);
+    const double outer = fadeBegin(h, m, w, l);
+    const bool watch = hoverWatch(h, m, w);
+    const LRESULT r = Proc(h, m, w, mouseMsg(m) ? designPt(l) : l);
+    fadeEnd(outer);
+    if (watch) hoverFade(h);
+    return r;
 }
 
 static void invalidateDesign(HWND h, const RECT& r) {
@@ -2195,7 +2243,7 @@ enum { FX_NONE, FX_OPEN, FX_CLOSE, FX_HIDE, FX_DOCK, FX_UNDOCK };
 struct WindowFx {
     int kind = FX_NONE;
     double start = 0.0, ms = 0.0;
-    bool faded = false;
+    bool faded = false, resizing = false;
 };
 static WindowFx winFx;
 
@@ -2208,7 +2256,7 @@ static BYTE windowAlphaByte() {
 }
 
 static void applyWindowAlpha(HWND h) {
-    if (!h || (h == hwndMain && (winFx.faded || winFx.kind != FX_NONE))) return;
+    if (!h || (h == hwndMain && (winFx.faded || winFx.resizing || winFx.kind != FX_NONE))) return;
     SetLayeredWindowAttributes(h, 0, windowAlphaByte(), LWA_ALPHA);
 }
 
@@ -2321,6 +2369,10 @@ static const int PRESET_LW  = 270;
 static const int PRESET_H   = 220;
 static const int PRESET_SBX = PRESET_X + PRESET_LW + 4;
 static const int PRESET_SBW = 12;
+static const RECT R_SB_UP    = {PRESET_SBX, PRESET_Y, PRESET_SBX + PRESET_SBW, PRESET_Y + PRESET_SBW};
+static const RECT R_SB_DOWN  = {PRESET_SBX, PRESET_Y + PRESET_H - PRESET_SBW, PRESET_SBX + PRESET_SBW, PRESET_Y + PRESET_H};
+static const RECT R_SB_TRACK = {PRESET_SBX, PRESET_Y + PRESET_SBW, PRESET_SBX + PRESET_SBW, PRESET_Y + PRESET_H - PRESET_SBW};
+static const RECT R_SB_ALL   = {PRESET_SBX, PRESET_Y, PRESET_SBX + PRESET_SBW, PRESET_Y + PRESET_H};
 
 static std::vector<Dev> uiMics, uiSpks;
 static HWND hMic, hSpk, hPreset;
@@ -2469,18 +2521,22 @@ static void dockDrop() {
     dock.frame.drop();
 }
 
-static bool dockGhost() {
-    if (dock.ghost) return true;
-    static bool classMade = false;
-    if (!classMade) {
-        WNDCLASSW wc{};
-        wc.lpfnWndProc = DefWindowProcW;
-        wc.hInstance = GetModuleHandleW(nullptr);
-        wc.lpszClassName = L"OctopusDock";
-        classMade = RegisterClassW(&wc) != 0;
+static HWND makeGhost(HWND owner, const wchar_t* cls, WNDPROC proc, DWORD exStyle) {
+    const HINSTANCE inst = GetModuleHandleW(nullptr);
+    WNDCLASSW wc{};
+    if (!GetClassInfoW(inst, cls, &wc)) {
+        wc.lpfnWndProc = proc;
+        wc.hInstance = inst;
+        wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+        wc.lpszClassName = cls;
+        RegisterClassW(&wc);
     }
-    dock.ghost = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
-                                 L"OctopusDock", L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    return CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | exStyle,
+                           cls, L"", WS_POPUP, 0, 0, 1, 1, owner, nullptr, inst, nullptr);
+}
+
+static bool dockGhost() {
+    if (!dock.ghost) dock.ghost = makeGhost(nullptr, L"OctopusDock", DefWindowProcW, WS_EX_TRANSPARENT | WS_EX_TOPMOST);
     return dock.ghost != nullptr;
 }
 
@@ -2804,11 +2860,12 @@ static int drawText(HDC dc, const wchar_t* s, int n, RECT* r, UINT flags) {
     }
     HGDIOBJ old = SelectObject(dc, deviceFont((HFONT)GetCurrentObject(dc, OBJ_FONT)));
     RECT d = scRect(*r);
-    OffsetRect(&d, 0, lift);
+    OffsetRect(&d, (int)lroundf(was.eDx), lift + (int)lroundf(was.eDy));
     flatDc(dc);
     const int h = DrawTextExW(dc, (LPWSTR)s, n, &d, flags, nullptr);
     SetWorldTransform(dc, &was);
     SelectObject(dc, old);
+    OffsetRect(&d, -(int)lroundf(was.eDx), -(int)lroundf(was.eDy));
     if (flags & DT_CALCRECT) *r = {unsc(d.left), unsc(d.top), (int)ceilf(d.right / uiScale), (int)ceilf(d.bottom / uiScale)};
     return (int)ceilf(h / uiScale);
 }
@@ -2851,6 +2908,15 @@ static int boxIcon(HWND h) {
     return ICO_NONE;
 }
 
+static bool snapPrint(HWND w, DockImage& img);
+static bool snapFaceAs(HWND box, DockImage& img, int open);
+static bool snapList(HWND list, HWND item, DockImage& img);
+static HWND boxOfList(HWND list);
+static uint32_t* dibBits(HBITMAP bmp);
+static void ghostRun(HWND owner, const RECT& at, DockImage& img, double ms, int peak = -1);
+static void listScrolled(HWND owner, HWND list, DockImage& before, int fromTop, int toTop);
+static bool fadeAllowed(HWND h);
+
 static const wchar_t* const COMBO_HOT = L"OctopusComboHot";
 
 static void drawDropArrow(HDC dc, float cx, float cy, bool up, COLORREF c) {
@@ -2866,88 +2932,537 @@ static void drawDropArrow(HDC dc, float cx, float cy, bool up, COLORREF c) {
     gr.DrawPolygon(&pen, p, 3);
 }
 
-static LRESULT CALLBACK comboSubProc(HWND h, UINT m, WPARAM w, LPARAM l,
-                                      UINT_PTR, DWORD_PTR) {
-    if (m == WM_PAINT) {
-        PAINTSTRUCT ps; HDC hdc = BeginPaint(h, &ps);
-        RECT dev; GetClientRect(h, &dev);
-        scaleDc(hdc);
-        const RECT rc = designRect(dev.right, dev.bottom);
-        const bool open = SendMessageW(h, CB_GETDROPPEDSTATE, 0, 0) != 0, lit = open || GetPropW(h, COMBO_HOT) != nullptr;
-
-        HBRUSH bg = CreateSolidBrush(C_BACK);
-        FillRect(hdc, &rc, bg); DeleteObject(bg);
-
-        HPEN pe = linePen(lit ? mixc(C_EDGE, C_GOLD, 0.55) : C_EDGE);
-        HGDIOBJ op = SelectObject(hdc, pe);
-        HGDIOBJ ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        frame(hdc, 0, 0, rc.right, rc.bottom);
-        SelectObject(hdc, op); SelectObject(hdc, ob); DeleteObject(pe);
-
-        const int AW = 22;
-        RECT az = {rc.right - AW, 1, rc.right - 1, rc.bottom - 1};
-        HBRUSH nb = CreateSolidBrush(lit ? mixc(C_NAVY, C_GOLD, 0.22) : C_NAVY);
-        FillRect(hdc, &az, nb); DeleteObject(nb);
-
-        HPEN sp2 = linePen(lit ? mixc(C_EDGE, C_GOLD, 0.55) : C_EDGE);
-        op = SelectObject(hdc, sp2);
-        MoveToEx(hdc, rc.right - AW, 1, nullptr);
-        LineTo(hdc, rc.right - AW, rc.bottom - 1);
-        SelectObject(hdc, op); DeleteObject(sp2);
-
-        drawDropArrow(hdc, rc.right - AW / 2.0f, (rc.top + rc.bottom) / 2.0f, open, lit ? mixc(C_GOLD, C_TEXT, 0.5) : C_GOLD);
-
-        int sel = (int)SendMessageW(h, CB_GETCURSEL, 0, 0);
-        wchar_t txt[256] = L"";
-        if (sel >= 0) {
-            if (h == hMic && sel < (int)uiMics.size()) wcsncpy_s(txt, uiMics[sel].name.c_str(), 255);
-            else if (h == hSpk && sel < (int)uiSpks.size()) wcsncpy_s(txt, uiSpks[sel].name.c_str(), 255);
-            else if (h == hApp) {
-                if (sel == 0) wcscpy_s(txt, L"(none)");
-                else if (sel - 1 < (int)uiApps.size()) wcsncpy_s(txt, uiApps[sel - 1].name.c_str(), 255);
-            }
-            else if (h == hEqBox && sel < (int)uiEqNames.size()) {
-                wcsncpy_s(txt, uiEqNames[sel].c_str(), 250);
-                if (!eqOnPreset()) wcscat_s(txt, L"*");
-            }
-            else if (h == hMaskBox && sel < voice::NUM_XFI_MASKS) maskLabel(sel, txt);
-            else if (h == hOwnBox && sel < voice::NUM_OWN_MASKS) maskLabel(voice::OWN_ORDER[sel], txt);
-            else if (h == hGlitchBox && sel < voice::NUM_GLITCH_STYLES) wcsncpy_s(txt, voice::GLITCH_LOOKS[sel].name, 255);
-        }
-        bool hint = false;
-        if (h == hMaskBox && (txt[0] == 0 || wcscmp(txt, L"X-Fi") == 0)) { wcscpy_s(txt, L"X-Fi"); hint = true; }
-        if (h == hOwnBox && txt[0] == 0) { wcscpy_s(txt, L"OctopusEAX masks"); hint = true; }
-        const int icon = boxIcon(h);
-        if (icon != ICO_NONE) drawIcon(hdc, 15.0f, (rc.top + rc.bottom) / 2.0f, icon, hint ? C_DIM : C_GOLD, C_BACK);
-        if (txt[0]) {
-            RECT tr = {icon != ICO_NONE ? 30 : 8, 0, rc.right - AW - 4, rc.bottom};
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, hint ? C_DIM : C_TEXT);
-            HGDIOBJ of = SelectObject(hdc, fntUI);
-            drawText(hdc, txt, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-            SelectObject(hdc, of);
-        }
-        EndPaint(h, &ps);
-        return 0;
+static void drawTurnArrow(HDC dc, float cx, float cy, double turn, COLORREF c) {
+    if (turn <= 0.0 || turn >= 1.0) {
+        drawDropArrow(dc, cx, cy, turn >= 1.0, c);
+        return;
     }
-    if (m == WM_MOUSEMOVE && !GetPropW(h, COMBO_HOT)) {
+    Gdiplus::Graphics gr(dc);
+    gr.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    gr.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+    gr.TranslateTransform(cx, cy);
+    gr.RotateTransform((Gdiplus::REAL)(180.0 * turn));
+    const Gdiplus::PointF p[3] = {{-4.2f, -2.1f}, {4.2f, -2.1f}, {0.0f, 2.6f}};
+    Gdiplus::SolidBrush br(gpColor(c));
+    Gdiplus::Pen pen(gpColor(c), 1.6f);
+    pen.SetLineJoin(Gdiplus::LineJoinRound);
+    gr.FillPolygon(&br, p, 3);
+    gr.DrawPolygon(&pen, p, 3);
+}
+
+struct FaceAnim {
+    HWND box = nullptr;
+    double turn = 0.0, glow = 0.0, at = 0.0;
+    bool open = false, running = false;
+};
+static std::vector<FaceAnim> faceAnims;
+static const UINT_PTR FACE_TIMER = 0x5A53;
+static const double FACE_TURN_MS = 220.0, FACE_GLOW_IN_MS = 110.0, FACE_GLOW_OUT_MS = 180.0;
+
+static double faceGlowWant(const FaceAnim& f) { return f.open || GetPropW(f.box, COMBO_HOT) ? 1.0 : 0.0; }
+
+static FaceAnim& faceOf(HWND box) {
+    for (FaceAnim& f : faceAnims)
+        if (f.box == box) return f;
+    FaceAnim f;
+    f.box = box;
+    f.open = SendMessageW(box, CB_GETDROPPEDSTATE, 0, 0) != 0;
+    f.turn = f.open ? 1.0 : 0.0;
+    f.glow = faceGlowWant(f);
+    faceAnims.push_back(f);
+    return faceAnims.back();
+}
+
+static void faceKick(HWND box) {
+    FaceAnim& f = faceOf(box);
+    if (!uiAnim || !fadeAllowed(GetAncestor(box, GA_ROOT))) {
+        f.turn = f.open ? 1.0 : 0.0;
+        f.glow = faceGlowWant(f);
+        if (f.running) KillTimer(box, FACE_TIMER);
+        f.running = false;
+        InvalidateRect(box, nullptr, FALSE);
+        return;
+    }
+    if (f.running) return;
+    f.running = true;
+    f.at = fxNow();
+    SetTimer(box, FACE_TIMER, 10, nullptr);
+}
+
+static void faceTick(HWND box) {
+    FaceAnim& f = faceOf(box);
+    const double now = fxNow(), ms = std::min(30.0, std::max(0.0, now - f.at));
+    f.at = now;
+    const double turnTo = f.open ? 1.0 : 0.0, glowTo = faceGlowWant(f);
+    auto step = [ms](double& v, double to, double up, double down) {
+        if (v < to) v = std::min(to, v + ms / up);
+        else if (v > to) v = std::max(to, v - ms / down);
+    };
+    step(f.turn, turnTo, FACE_TURN_MS, FACE_TURN_MS);
+    step(f.glow, glowTo, FACE_GLOW_IN_MS, FACE_GLOW_OUT_MS);
+    InvalidateRect(box, nullptr, FALSE);
+    if (f.turn == turnTo && f.glow == glowTo) {
+        KillTimer(box, FACE_TIMER);
+        f.running = false;
+    }
+}
+
+static void paintComboFace(HWND h, HDC hdc, int openAs = -1) {
+    RECT dev; GetClientRect(h, &dev);
+    scaleDc(hdc);
+    const RECT rc = designRect(dev.right, dev.bottom);
+    const bool hot = GetPropW(h, COMBO_HOT) != nullptr;
+    double turn = 0.0, glow = 0.0;
+    if (openAs >= 0) {
+        turn = openAs ? 1.0 : 0.0;
+        glow = openAs || hot ? 1.0 : 0.0;
+    } else if (!uiAnim) {
+        const bool open = SendMessageW(h, CB_GETDROPPEDSTATE, 0, 0) != 0;
+        turn = open ? 1.0 : 0.0;
+        glow = open || hot ? 1.0 : 0.0;
+    } else {
+        const FaceAnim& f = faceOf(h);
+        turn = easeInOut(f.turn);
+        glow = f.glow;
+    }
+
+    const int AW = 22;
+    float arrowX = rc.right - AW / 2.0f;
+    const float arrowY = dev.bottom / 2.0f / uiScale;
+    {
+        PixelSnap px(hdc);
+        const int t = px.line();
+        const COLORREF edge = mixc(C_EDGE, mixc(C_EDGE, C_GOLD, 0.55), glow);
+        const RECT whole = {0, 0, dev.right, dev.bottom};
+        HBRUSH bg = CreateSolidBrush(C_BACK);
+        FillRect(hdc, &whole, bg);
+        DeleteObject(bg);
+        const LONG split = dev.right - (px.x((float)AW) - px.x(0.0f));
+        const RECT zone = {split + t, t, dev.right - t, dev.bottom - t};
+        HBRUSH nb = CreateSolidBrush(mixc(C_NAVY, mixc(C_NAVY, C_GOLD, 0.22), glow));
+        FillRect(hdc, &zone, nb);
+        DeleteObject(nb);
+        edgeLines(hdc, whole, t, edge);
+        const RECT divider = {split, t, split + t, dev.bottom - t};
+        HBRUSH db = CreateSolidBrush(edge);
+        FillRect(hdc, &divider, db);
+        DeleteObject(db);
+        arrowX = (zone.left + zone.right) / 2.0f / uiScale;
+    }
+
+    drawTurnArrow(hdc, arrowX, arrowY, turn, mixc(C_GOLD, mixc(C_GOLD, C_TEXT, 0.5), glow));
+
+    int sel = (int)SendMessageW(h, CB_GETCURSEL, 0, 0);
+    wchar_t txt[256] = L"";
+    if (sel >= 0) {
+        if (h == hMic && sel < (int)uiMics.size()) wcsncpy_s(txt, uiMics[sel].name.c_str(), 255);
+        else if (h == hSpk && sel < (int)uiSpks.size()) wcsncpy_s(txt, uiSpks[sel].name.c_str(), 255);
+        else if (h == hApp) {
+            if (sel == 0) wcscpy_s(txt, L"(none)");
+            else if (sel - 1 < (int)uiApps.size()) wcsncpy_s(txt, uiApps[sel - 1].name.c_str(), 255);
+        }
+        else if (h == hEqBox && sel < (int)uiEqNames.size()) {
+            wcsncpy_s(txt, uiEqNames[sel].c_str(), 250);
+            if (!eqOnPreset()) wcscat_s(txt, L"*");
+        }
+        else if (h == hMaskBox && sel < voice::NUM_XFI_MASKS) maskLabel(sel, txt);
+        else if (h == hOwnBox && sel < voice::NUM_OWN_MASKS) maskLabel(voice::OWN_ORDER[sel], txt);
+        else if (h == hGlitchBox && sel < voice::NUM_GLITCH_STYLES) wcsncpy_s(txt, voice::GLITCH_LOOKS[sel].name, 255);
+    }
+    bool hint = false;
+    if (h == hMaskBox && (txt[0] == 0 || wcscmp(txt, L"X-Fi") == 0)) { wcscpy_s(txt, L"X-Fi"); hint = true; }
+    if (h == hOwnBox && txt[0] == 0) { wcscpy_s(txt, L"OctopusEAX masks"); hint = true; }
+    const int icon = boxIcon(h);
+    if (icon != ICO_NONE) drawIcon(hdc, 15.0f, (rc.top + rc.bottom) / 2.0f, icon, hint ? C_DIM : C_GOLD, C_BACK);
+    if (txt[0]) {
+        RECT tr = {icon != ICO_NONE ? 30 : 8, 0, rc.right - AW - 4, rc.bottom};
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, hint ? C_DIM : C_TEXT);
+        HGDIOBJ of = SelectObject(hdc, fntUI);
+        drawText(hdc, txt, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        SelectObject(hdc, of);
+    }
+    flatDc(hdc);
+}
+
+static void comboHover(HWND h, bool on) {
+    if (on) {
         SetPropW(h, COMBO_HOT, (HANDLE)1);
         TRACKMOUSEEVENT t = {sizeof t, TME_LEAVE, h, 0};
         TrackMouseEvent(&t);
-        InvalidateRect(h, nullptr, FALSE);
-    } else if (m == WM_MOUSELEAVE) {
+    } else {
         RemovePropW(h, COMBO_HOT);
-        InvalidateRect(h, nullptr, FALSE);
+    }
+    faceKick(h);
+}
+
+static LRESULT CALLBACK comboSubProc(HWND h, UINT m, WPARAM w, LPARAM l,
+                                      UINT_PTR, DWORD_PTR) {
+    if (m == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        HDC mem = CreateCompatibleDC(hdc);
+        HBITMAP bm = mem ? CreateCompatibleBitmap(hdc, rc.right, rc.bottom) : nullptr;
+        if (bm) {
+            HGDIOBJ ob = SelectObject(mem, bm);
+            paintComboFace(h, mem);
+            BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, ob);
+            DeleteObject(bm);
+        } else {
+            paintComboFace(h, hdc);
+        }
+        if (mem) DeleteDC(mem);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    if (m == WM_TIMER && w == FACE_TIMER) {
+        faceTick(h);
+        return 0;
+    }
+    if (m == WM_PRINTCLIENT) {
+        paintComboFace(h, (HDC)w);
+        return 0;
+    }
+    if (m == WM_MOUSEMOVE && !GetPropW(h, COMBO_HOT)) {
+        comboHover(h, true);
+    } else if (m == WM_MOUSELEAVE) {
+        comboHover(h, false);
     } else if (m == WM_NCDESTROY) {
         RemovePropW(h, COMBO_HOT);
+        for (size_t i = 0; i < faceAnims.size(); ++i)
+            if (faceAnims[i].box == h) {
+                faceAnims.erase(faceAnims.begin() + (std::ptrdiff_t)i);
+                break;
+            }
     }
     if (m == WM_NCPAINT) return 0;
     return DefSubclassProc(h, m, w, l);
 }
 
+static HWND dropListOf(HWND box);
+
+struct ItemGlow {
+    int item = -1;
+    double level = 0.0;
+};
+
+struct ListShine {
+    HWND list = nullptr;
+    ItemGlow selIn, selOut, overIn, overOut;
+    double at = 0.0;
+    bool running = false;
+};
+static std::vector<ListShine> listShines;
+static const UINT_PTR SHINE_TIMER = 0x5A51, DROP_TIMER = 0x5A52;
+static const double SHINE_IN_MS = 90.0, SHINE_OUT_MS = 180.0, DROP_MS = 210.0;
+
+static ListShine& shineOf(HWND list) {
+    for (ListShine& s : listShines)
+        if (s.list == list) return s;
+    listShines.push_back(ListShine{});
+    listShines.back().list = list;
+    return listShines.back();
+}
+
+static void shineItem(HWND list, int item) {
+    RECT r;
+    if (item >= 0 && SendMessageW(list, LB_GETITEMRECT, (WPARAM)item, (LPARAM)&r) != LB_ERR) InvalidateRect(list, &r, FALSE);
+}
+
+static void shineMove(HWND list, ItemGlow& in, ItemGlow& out, int item) {
+    if (item == in.item) return;
+    if (item == out.item) {
+        std::swap(in, out);
+        return;
+    }
+    if (in.item >= 0 && in.level > 0.0) {
+        if (out.item >= 0) shineItem(list, out.item);
+        out = in;
+    }
+    in = {item, 0.0};
+}
+
+static void shineKick(ListShine& s) {
+    if (s.running) return;
+    s.running = true;
+    s.at = fxNow();
+    SetTimer(s.list, SHINE_TIMER, 10, nullptr);
+}
+
+static void shineReset(HWND list, int sel) {
+    ListShine& s = shineOf(list);
+    s.selIn = {sel, 1.0};
+    s.selOut = ItemGlow{};
+}
+
+static double shineSel(HWND list, int item, bool sel) {
+    if (!uiAnim || !list) return sel ? 1.0 : 0.0;
+    ListShine& s = shineOf(list);
+    if (sel != (item == s.selIn.item)) {
+        shineMove(list, s.selIn, s.selOut, sel ? item : -1);
+        shineKick(s);
+    }
+    return item == s.selIn.item ? s.selIn.level : (item == s.selOut.item ? s.selOut.level : 0.0);
+}
+
+static double shineOver(HWND list, int item) {
+    if (!list) return 0.0;
+    const ListShine& s = shineOf(list);
+    return item == s.overIn.item ? s.overIn.level : (item == s.overOut.item ? s.overOut.level : 0.0);
+}
+
+static void shineHover(HWND list, int item) {
+    ListShine& s = shineOf(list);
+    if (item == s.overIn.item) return;
+    if (!uiAnim) {
+        shineItem(list, s.overIn.item);
+        shineItem(list, s.overOut.item);
+        s.overIn = {item, 1.0};
+        s.overOut = ItemGlow{};
+        shineItem(list, item);
+        return;
+    }
+    shineMove(list, s.overIn, s.overOut, item);
+    shineKick(s);
+}
+
+static void shineTick(HWND list) {
+    ListShine& s = shineOf(list);
+    const double now = fxNow(), ms = std::max(0.0, now - s.at);
+    s.at = now;
+    bool moving = false;
+    auto rise = [&](ItemGlow& gl) {
+        if (gl.item < 0 || gl.level >= 1.0) return;
+        gl.level = std::min(1.0, gl.level + ms / SHINE_IN_MS);
+        shineItem(list, gl.item);
+        moving = true;
+    };
+    auto fall = [&](ItemGlow& gl) {
+        if (gl.item < 0) return;
+        gl.level = std::max(0.0, gl.level - ms / SHINE_OUT_MS);
+        shineItem(list, gl.item);
+        if (gl.level <= 0.0) gl = ItemGlow{};
+        moving = true;
+    };
+    rise(s.selIn);
+    fall(s.selOut);
+    rise(s.overIn);
+    fall(s.overOut);
+    if (!moving) {
+        KillTimer(list, SHINE_TIMER);
+        s.running = false;
+    }
+}
+
+struct DropOpen {
+    HWND list = nullptr, box = nullptr, ghost = nullptr;
+    DockImage img;
+    double at = 0.0, k = 0.0;
+    bool armed = false, running = false, shown = false;
+};
+static DropOpen dropOpen;
+
+struct RollGhost {
+    HWND ghost = nullptr, list = nullptr;
+    DockImage img;
+    RECT at{};
+    int dir = 1;
+    double from = 1.0, start = 0.0;
+};
+static std::vector<RollGhost> rollGhosts;
+static UINT_PTR rollTimer = 0;
+static const double ROLL_MS = 160.0;
+
+static void dropAlpha(HWND list, BYTE a) {
+    SetLayeredWindowAttributes(list, 0, a, LWA_ALPHA);
+}
+
+static bool listBar(HWND list) {
+    RECT wr, cr;
+    POINT o = {0, 0};
+    return GetWindowRect(list, &wr) && GetClientRect(list, &cr) && ClientToScreen(list, &o) &&
+           (int)cr.right < (int)(wr.right - wr.left) - 2 * (int)(o.x - wr.left);
+}
+
+static int dropDir(HWND list, HWND box) {
+    RECT lr, br;
+    if (!box || !GetWindowRect(list, &lr) || !GetWindowRect(box, &br)) return 1;
+    return lr.top >= br.top ? 1 : -1;
+}
+
+static void rollPaint(HWND ghost, const DockImage& img, const RECT& at, int dir, double shown, BYTE alpha) {
+    const int vh = std::max(1, std::min(img.h, (int)std::lround(shown * img.h)));
+    POINT pos = {at.left, dir > 0 ? at.top : at.bottom - vh}, src = {0, dir > 0 ? img.h - vh : 0};
+    SIZE size = {img.w, vh};
+    BLENDFUNCTION bf = {AC_SRC_OVER, 0, alpha, 0};
+    UpdateLayeredWindow(ghost, nullptr, &pos, &size, img.dc, &src, 0, &bf, ULW_ALPHA);
+}
+
+static BYTE rollAlpha(double shown) { return (BYTE)std::lround(255.0 * (0.4 + 0.6 * shown)); }
+
+static void dropStop() {
+    DropOpen d = dropOpen;
+    dropOpen = DropOpen{};
+    if (d.list && IsWindow(d.list)) {
+        if (d.running) KillTimer(d.list, DROP_TIMER);
+        dropAlpha(d.list, 255);
+    }
+    if (d.ghost && IsWindow(d.ghost)) DestroyWindow(d.ghost);
+    d.img.drop();
+}
+
+static void dropPlace(bool step = true) {
+    DropOpen& d = dropOpen;
+    if (step) {
+        const double now = fxNow();
+        d.k = std::min(1.0, d.k + std::min(24.0, std::max(0.0, now - d.at)) / DROP_MS);
+        d.at = now;
+    }
+    RECT at;
+    if (d.k >= 1.0 || !GetWindowRect(d.list, &at)) {
+        dropStop();
+        return;
+    }
+    const int w = (int)(at.right - at.left), h = (int)(at.bottom - at.top);
+    const bool bar = listBar(d.list);
+    if (!d.img.dc || d.img.w != w || d.img.h != h || !bar) {
+        if (bar) UpdateWindow(d.list);
+        if (!snapList(d.list, d.box, d.img) || d.img.w != w || d.img.h != h) {
+            dropStop();
+            return;
+        }
+    }
+    const double shown = 1.0 - (1.0 - d.k) * (1.0 - d.k) * (1.0 - d.k);
+    rollPaint(d.ghost, d.img, at, dropDir(d.list, d.box), shown, rollAlpha(shown));
+    if (!d.shown) {
+        d.shown = true;
+        SetWindowPos(d.ghost, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+}
+
+static void rollEnd(size_t i) {
+    RollGhost r = rollGhosts[i];
+    rollGhosts.erase(rollGhosts.begin() + (std::ptrdiff_t)i);
+    if (IsWindow(r.ghost)) DestroyWindow(r.ghost);
+    r.img.drop();
+}
+
+static void CALLBACK rollTick(HWND, UINT, UINT_PTR, DWORD) {
+    const double now = fxNow();
+    for (size_t i = 0; i < rollGhosts.size();) {
+        RollGhost& r = rollGhosts[i];
+        const double k = (now - r.start) / ROLL_MS;
+        if (k >= 1.0 || !IsWindow(r.ghost)) {
+            rollEnd(i);
+            continue;
+        }
+        const double shown = r.from * (1.0 - k * k);
+        rollPaint(r.ghost, r.img, r.at, r.dir, shown, rollAlpha(shown));
+        ++i;
+    }
+    if (rollGhosts.empty() && rollTimer) {
+        KillTimer(nullptr, rollTimer);
+        rollTimer = 0;
+    }
+}
+
+static void dropBegin(HWND list) {
+    DropOpen& d = dropOpen;
+    if (!d.armed || d.list != list) return;
+    d.armed = false;
+    if (!fadeAllowed(hwndMain)) {
+        dropStop();
+        return;
+    }
+    d.ghost = makeGhost(nullptr, L"OctopusDock", DefWindowProcW, WS_EX_TRANSPARENT | WS_EX_TOPMOST);
+    if (!d.ghost) {
+        dropStop();
+        return;
+    }
+    for (size_t i = 0; i < rollGhosts.size();)
+        if (rollGhosts[i].list == list) rollEnd(i);
+        else ++i;
+    d.at = fxNow();
+    d.k = 0.0;
+    d.running = true;
+    SetTimer(list, DROP_TIMER, 10, nullptr);
+    if (!listBar(list)) dropPlace(false);
+}
+
+static void dropArm(HWND box) {
+    dropStop();
+    const HWND list = dropListOf(box);
+    if (!list || !(GetWindowLongPtrW(list, GWL_EXSTYLE) & WS_EX_LAYERED)) return;
+    dropOpen.list = list;
+    dropOpen.box = box;
+    dropOpen.armed = true;
+    if (IsWindowVisible(list)) dropBegin(list);
+    else if (fadeAllowed(hwndMain)) dropAlpha(list, 1);
+}
+
+static void dropPlaced(HWND list, UINT flags) {
+    if (flags & SWP_SHOWWINDOW) {
+        dropBegin(list);
+        return;
+    }
+    if (dropOpen.list != list || (flags & (SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE))) return;
+    if (dropOpen.armed && !IsWindowVisible(list)) ShowWindow(list, SW_SHOWNA);
+}
+
+static void dropShown(HWND box) {
+    const HWND list = dropListOf(box);
+    if (!dropOpen.armed || dropOpen.list != list) return;
+    if (IsWindowVisible(list)) dropBegin(list);
+    else dropStop();
+}
+
+static void dropRollUp(HWND list, HWND box) {
+    double from = 1.0;
+    if (dropOpen.list == list && dropOpen.running) from = dropOpen.shown ? 1.0 - (1.0 - dropOpen.k) * (1.0 - dropOpen.k) * (1.0 - dropOpen.k) : 0.0;
+    if (from < 0.05) return;
+    RollGhost r;
+    if (!GetWindowRect(list, &r.at) || !snapList(list, box, r.img) || r.img.h != (int)(r.at.bottom - r.at.top)) {
+        r.img.drop();
+        return;
+    }
+    r.ghost = makeGhost(nullptr, L"OctopusDock", DefWindowProcW, WS_EX_TRANSPARENT | WS_EX_TOPMOST);
+    if (!r.ghost) {
+        r.img.drop();
+        return;
+    }
+    r.list = list;
+    r.dir = dropDir(list, box);
+    r.from = from;
+    r.start = fxNow();
+    rollPaint(r.ghost, r.img, r.at, r.dir, from, rollAlpha(from));
+    SetWindowPos(r.ghost, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    rollGhosts.push_back(r);
+    if (!rollTimer) rollTimer = SetTimer(nullptr, 0, 10, rollTick);
+}
+
 static LRESULT CALLBACK listFrameProc(HWND h, UINT m, WPARAM w, LPARAM l,
                                       UINT_PTR, DWORD_PTR) {
+    if (m == WM_TIMER && w == DROP_TIMER) {
+        if (dropOpen.running && dropOpen.list == h) dropPlace();
+        else KillTimer(h, DROP_TIMER);
+        return 0;
+    }
+    if (m == WM_TIMER && w == SHINE_TIMER) {
+        shineTick(h);
+        return 0;
+    }
+    if (m == WM_WINDOWPOSCHANGING && dropOpen.armed && dropOpen.list == h && !IsWindowVisible(h) &&
+        !(((const WINDOWPOS*)l)->flags & (SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE)))
+        ((WINDOWPOS*)l)->flags |= SWP_SHOWWINDOW | SWP_NOACTIVATE;
+    if (m == WM_WINDOWPOSCHANGING && (((const WINDOWPOS*)l)->flags & SWP_HIDEWINDOW) && IsWindowVisible(h)) {
+        if (fadeAllowed(hwndMain)) dropRollUp(h, boxOfList(h));
+        if (dropOpen.list == h) dropStop();
+    }
     const LRESULT r = DefSubclassProc(h, m, w, l);
+    if (m == WM_WINDOWPOSCHANGED) dropPlaced(h, ((const WINDOWPOS*)l)->flags);
     if (m == WM_NCPAINT) {
         HDC dc = GetWindowDC(h);
         RECT rc; GetWindowRect(h, &rc); OffsetRect(&rc, -rc.left, -rc.top);
@@ -2964,13 +3479,206 @@ static void dressList(HWND combo) {
     ci.cbSize = sizeof(ci);
     if (!GetComboBoxInfo(combo, &ci) || !ci.hwndList) return;
     SetWindowTheme(ci.hwndList, L"", L"");
+    SetWindowLongPtrW(ci.hwndList, GWL_EXSTYLE, GetWindowLongPtrW(ci.hwndList, GWL_EXSTYLE) | WS_EX_LAYERED);
+    SetLayeredWindowAttributes(ci.hwndList, 0, 255, LWA_ALPHA);
     SetWindowSubclass(ci.hwndList, listFrameProc, 0, 0);
+}
+
+static const UINT WM_FIT_DROP = WM_APP + 49;
+static const UINT WM_FACE_FADE = WM_APP + 51;
+
+struct FaceShot {
+    HWND box = nullptr;
+    DockImage before;
+};
+static std::vector<FaceShot> faceShots;
+
+static bool faceText(HWND box, DockImage& img, RECT& at) {
+    DockImage whole;
+    RECT cr;
+    POINT o = {0, 0};
+    if (!snapFaceAs(box, whole, 0) || !GetClientRect(box, &cr) || !ClientToScreen(box, &o)) {
+        whole.drop();
+        return false;
+    }
+    const int line = uiScale >= 1.0f && uiScale == floorf(uiScale) ? (int)uiScale : 1;
+    const int inset = line + 1, w = (int)cr.right - sc(22) - 2 * inset, hh = (int)cr.bottom - 2 * inset;
+    const bool ok = w > 0 && hh > 0 && img.make(w, hh);
+    if (ok) {
+        BitBlt(img.dc, 0, 0, w, hh, whole.dc, inset, inset, SRCCOPY);
+        GdiFlush();
+        at = {o.x + inset, o.y + inset, o.x + inset + w, o.y + inset + hh};
+    }
+    whole.drop();
+    return ok;
+}
+
+static void faceChange(HWND box, HWND owner, bool opening) {
+    faceOf(box).open = opening;
+    faceKick(box);
+    if (!opening) return;
+    for (size_t i = 0; i < faceShots.size(); ++i)
+        if (faceShots[i].box == box) {
+            faceShots[i].before.drop();
+            faceShots.erase(faceShots.begin() + (std::ptrdiff_t)i);
+            break;
+        }
+    if (!fadeAllowed(owner)) return;
+    FaceShot shot;
+    shot.box = box;
+    RECT at;
+    if (faceText(box, shot.before, at)) faceShots.push_back(shot);
+    else shot.before.drop();
+}
+
+static void faceFade(HWND owner, HWND box) {
+    for (size_t i = 0; i < faceShots.size(); ++i) {
+        if (faceShots[i].box != box) continue;
+        DockImage before = faceShots[i].before;
+        faceShots.erase(faceShots.begin() + (std::ptrdiff_t)i);
+        DockImage now;
+        RECT at;
+        bool differs = false;
+        if (fadeAllowed(owner) && faceText(box, now, at) && now.w == before.w && now.h == before.h) {
+            const uint32_t* a = dibBits(now.bmp);
+            const uint32_t* b = dibBits(before.bmp);
+            differs = a && b && memcmp(a, b, (size_t)now.w * now.h * 4) != 0;
+        }
+        now.drop();
+        if (differs) ghostRun(owner, at, before, 160.0);
+        else before.drop();
+        return;
+    }
+}
+
+static void nudgeList(HWND list) {
+    RECT lr;
+    GetWindowRect(list, &lr);
+    const int w = (int)(lr.right - lr.left), h = (int)(lr.bottom - lr.top);
+    const UINT keep = SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE;
+    SetWindowPos(list, nullptr, 0, 0, w, h + 1, keep);
+    SetWindowPos(list, nullptr, 0, 0, w, h, keep);
+}
+
+static HWND dropListOf(HWND box) {
+    COMBOBOXINFO ci{};
+    ci.cbSize = sizeof(ci);
+    return box && GetComboBoxInfo(box, &ci) ? ci.hwndList : nullptr;
+}
+
+static void fitDropList(HWND box) {
+    if (!box || !SendMessageW(box, CB_GETDROPPEDSTATE, 0, 0)) return;
+    const HWND list = dropListOf(box);
+    if (!list) return;
+    const int itemH = (int)SendMessageW(list, LB_GETITEMHEIGHT, 0, 0);
+    if (itemH <= 0) return;
+    const int count = std::max(1, (int)SendMessageW(box, CB_GETCOUNT, 0, 0));
+    const int most = (int)SendMessageW(box, CB_GETMINVISIBLE, 0, 0);
+    const int rows = box == hMic || box == hSpk || most <= 0 ? count : std::min(count, most);
+    RECT lr, cr, inner;
+    GetWindowRect(list, &lr);
+    GetWindowRect(box, &cr);
+    GetClientRect(list, &inner);
+    const int frame = (int)(lr.bottom - lr.top) - (int)inner.bottom;
+    const HMONITOR mon = MonitorFromWindow(box, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    const bool known = GetMonitorInfoW(mon, &mi) != FALSE;
+    const bool onScreen = !known || (lr.top >= mi.rcMonitor.top && lr.bottom <= mi.rcMonitor.bottom);
+    if ((int)(lr.bottom - lr.top) == rows * itemH + frame && onScreen) {
+        nudgeList(list);
+        return;
+    }
+    const RECT wa = known ? mi.rcWork : workAreaOf(mon);
+    const int below = (int)(wa.bottom - cr.bottom), above = (int)(cr.top - wa.top);
+    const bool down = rows * itemH + frame <= below || below >= above;
+    const int fit = std::max(1, std::min(rows, ((down ? below : above) - frame) / itemH));
+    const int h = fit * itemH + frame;
+    const int top = down ? (int)cr.bottom : (int)cr.top - h;
+    const int w = (int)(lr.right - lr.left);
+    SetWindowPos(list, nullptr, lr.left, top, w, h + 1, SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(list, nullptr, lr.left, top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static void primeDropList(HWND box) {
+    if (SendMessageW(box, CB_GETDROPPEDSTATE, 0, 0)) {
+        fitDropList(box);
+        return;
+    }
+    if (const HWND list = dropListOf(box)) nudgeList(list);
+}
+
+static bool roomTracked = false;
+
+static void roomHoverRefresh() {
+    POINT c;
+    if (!hPreset || !GetCursorPos(&c) || WindowFromPoint(c) != hPreset || !ScreenToClient(hPreset, &c)) return;
+    if (!roomTracked) {
+        TRACKMOUSEEVENT t = {sizeof t, TME_LEAVE, hPreset, 0};
+        roomTracked = TrackMouseEvent(&t) != FALSE;
+    }
+    const LRESULT hit = SendMessageW(hPreset, LB_ITEMFROMPOINT, 0, MAKELPARAM(c.x, c.y));
+    shineHover(hPreset, HIWORD(hit) ? -1 : (int)LOWORD(hit));
 }
 
 static LRESULT CALLBACK listWheelProc(HWND h, UINT m, WPARAM w, LPARAM l,
                                       UINT_PTR, DWORD_PTR) {
     if (m == WM_MOUSEWHEEL) return SendMessageW(GetParent(h), WM_MOUSEWHEEL, w, l);
+    if (m == WM_TIMER && w == SHINE_TIMER) {
+        shineTick(h);
+        return 0;
+    }
+    if (m == WM_MOUSEMOVE) {
+        if (!roomTracked) {
+            TRACKMOUSEEVENT t = {sizeof t, TME_LEAVE, h, 0};
+            roomTracked = TrackMouseEvent(&t) != FALSE;
+        }
+        const LRESULT hit = SendMessageW(h, LB_ITEMFROMPOINT, 0, l);
+        shineHover(h, HIWORD(hit) ? -1 : (int)LOWORD(hit));
+    } else if (m == WM_MOUSELEAVE) {
+        roomTracked = false;
+        shineHover(h, -1);
+    }
+    if ((m == WM_LBUTTONDOWN || (m == WM_KEYDOWN && !(l & 0x40000000))) && fadeAllowed(GetAncestor(h, GA_ROOT))) {
+        const int top = (int)SendMessageW(h, LB_GETTOPINDEX, 0, 0);
+        DockImage before;
+        if (snapList(h, h, before)) {
+            DefSubclassProc(h, WM_SETREDRAW, FALSE, 0);
+            const LRESULT r = DefSubclassProc(h, m, w, l);
+            DefSubclassProc(h, WM_SETREDRAW, TRUE, 0);
+            InvalidateRect(h, nullptr, FALSE);
+            const int now = (int)SendMessageW(h, LB_GETTOPINDEX, 0, 0);
+            if (now != top) {
+                UpdateWindow(h);
+                listScrolled(GetAncestor(h, GA_ROOT), h, before, top, now);
+                roomHoverRefresh();
+            } else {
+                before.drop();
+            }
+            return r;
+        }
+        before.drop();
+    }
     return DefSubclassProc(h, m, w, l);
+}
+
+static void presetTopTo(HWND h, int nt) {
+    const int top = (int)SendMessageW(hPreset, LB_GETTOPINDEX, 0, 0);
+    if (nt == top) return;
+    DockImage before;
+    const bool fade = fadeAllowed(h) && snapList(hPreset, hPreset, before);
+    SendMessageW(hPreset, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(hPreset, LB_SETTOPINDEX, (WPARAM)nt, 0);
+    SendMessageW(hPreset, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(hPreset, nullptr, FALSE);
+    if (!fade) {
+        before.drop();
+        roomHoverRefresh();
+        return;
+    }
+    UpdateWindow(hPreset);
+    listScrolled(h, hPreset, before, top, (int)SendMessageW(hPreset, LB_GETTOPINDEX, 0, 0));
+    roomHoverRefresh();
 }
 
 static std::vector<Dev> speakerDevices() {
@@ -3028,6 +3736,7 @@ static void deviceBoxSet(bool mics, std::vector<Dev>& fresh) {
     SendMessageW(box, CB_SETCURSEL, sel, 0);
     SendMessageW(box, WM_SETREDRAW, TRUE, 0);
     RedrawWindow(box, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+    fitDropList(box);
 }
 
 static void devicesScan(HWND h, bool asked) {
@@ -3132,28 +3841,15 @@ static void fillPrograms() {
 }
 
 static void outline(HDC dc, RECT r, COLORREF edge) {
-    HPEN p = linePen(edge);
-    HGDIOBJ op = SelectObject(dc, p);
-    HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
-    frame(dc, r.left, r.top, r.right, r.bottom);
-    SelectObject(dc, op);
-    SelectObject(dc, ob);
-    DeleteObject(p);
+    PixelSnap px(dc);
+    edgeLines(dc, px.map(r), px.line(), edge);
 }
 
 static SIZE boxPx = {0, 0};
 
 static void boxEdge(HDC dc) {
-    XFORM keep{};
-    GetWorldTransform(dc, &keep);
-    flatDc(dc);
-    const int t = uiScale == floorf(uiScale) ? (int)uiScale : 1;
-    const int w = boxPx.cx, hh = boxPx.cy;
-    HBRUSH b = CreateSolidBrush(C_GOLD);
-    const RECT sides[4] = {{0, 0, w, t}, {0, hh - t, w, hh}, {0, 0, t, hh}, {w - t, 0, w, hh}};
-    for (const RECT& side : sides) FillRect(dc, &side, b);
-    DeleteObject(b);
-    SetWorldTransform(dc, &keep);
+    PixelSnap px(dc);
+    edgeLines(dc, RECT{0, 0, boxPx.cx, boxPx.cy}, px.line(), C_GOLD);
 }
 
 static int fadeAlpha(double k) {
@@ -3162,8 +3858,10 @@ static int fadeAlpha(double k) {
 }
 
 static void panel(HDC dc, RECT r, COLORREF fill, COLORREF edge, int alpha = -1) {
-    blendRect(dc, r, fill, (BYTE)(alpha < 0 ? alphaFor(fill) : alpha));
-    outline(dc, r, edge);
+    PixelSnap px(dc);
+    const RECT d = px.map(r);
+    blendRect(dc, d, fill, (BYTE)(alpha < 0 ? alphaFor(fill) : alpha));
+    edgeLines(dc, d, px.line(), edge);
 }
 
 static void label(HDC dc, int x, int y, const wchar_t* s, COLORREF c, HFONT f) {
@@ -3620,8 +4318,18 @@ static void buttonFace(HDC dc, const RECT& r, int icon, const wchar_t* text, COL
 }
 
 struct HotFade { RECT r; double level; };
-static HotFade hotIn = {{0, 0, 0, 0}, 0.0}, hotOut = {{0, 0, 0, 0}, 0.0};
-static const double HOT_IN_MS = 110.0, HOT_OUT_MS = 170.0, TICK_MS = 180.0;
+static HotFade hotIn = {{0, 0, 0, 0}, 0.0}, hotOut = {{0, 0, 0, 0}, 0.0}, hotPress = {{0, 0, 0, 0}, 0.0};
+static const double HOT_IN_MS = 110.0, HOT_OUT_MS = 170.0, TICK_MS = 180.0, PRESS_MS = 260.0;
+static bool boxPainting = false;
+
+static void hotPressAt(const RECT& r) {
+    if (!uiAnim || IsRectEmpty(&r)) return;
+    hotPress = {r, 1.0};
+}
+
+static double pressLevelFor(const RECT& r) {
+    return !boxPainting && EqualRect(&r, &hotPress.r) ? hotPress.level : 0.0;
+}
 
 static void hotMoveTo(const RECT& now) {
     if (EqualRect(&now, &hotOut.r)) {
@@ -3635,6 +4343,13 @@ static void hotMoveTo(const RECT& now) {
     if (IsRectEmpty(&hotIn.r)) hotIn.level = 0.0;
 }
 
+static void hotLeave(HWND h) {
+    if (IsRectEmpty(&hotRect)) return;
+    invalidateDesign(h, hotRect);
+    SetRectEmpty(&hotRect);
+    hotMoveTo(hotRect);
+}
+
 static bool hotFadeStep(double ms) {
     bool moving = false;
     if (!IsRectEmpty(&hotIn.r) && hotIn.level < 1.0) { hotIn.level = std::min(1.0, hotIn.level + ms / HOT_IN_MS); moving = true; }
@@ -3643,10 +4358,16 @@ static bool hotFadeStep(double ms) {
         if (hotOut.level == 0.0) SetRectEmpty(&hotOut.r);
         moving = true;
     }
+    if (hotPress.level > 0.0) {
+        hotPress.level = std::max(0.0, hotPress.level - ms / PRESS_MS);
+        if (hotPress.level == 0.0) SetRectEmpty(&hotPress.r);
+        moving = true;
+    }
     return moving;
 }
 
 static double hotLevelFor(const RECT& r, bool hot) {
+    if (boxPainting || !uiAnim) return hot ? 1.0 : 0.0;
     if (hot) return EqualRect(&r, &hotIn.r) ? hotIn.level : 1.0;
     if (EqualRect(&r, &hotOut.r)) return hotOut.level;
     return 0.0;
@@ -3655,12 +4376,14 @@ static double hotLevelFor(const RECT& r, bool hot) {
 static void iconButton(HDC dc, const RECT& r, int icon, const wchar_t* text, bool hot, bool enabled = true, bool lit = false) {
     if (!enabled) { buttonFace(dc, r, icon, text, C_PANEL, C_EDGE, C_OFF); return; }
     const double k = lit ? 1.0 : hotLevelFor(r, hot);
-    buttonFace(dc, r, icon, text, mixc(C_BACK, C_NAVY, k), mixc(C_EDGE, C_GOLD, k), mixc(C_TEXT, C_GOLD, k), fadeAlpha(k));
+    const COLORREF fill = mixc(mixc(C_BACK, C_NAVY, k), C_GOLD, 0.22 * pressLevelFor(r));
+    buttonFace(dc, r, icon, text, fill, mixc(C_EDGE, C_GOLD, k), mixc(C_TEXT, C_GOLD, k), fadeAlpha(k));
 }
 
 static void primaryButton(HDC dc, const RECT& r, int icon, const wchar_t* text, bool hot, bool enabled = true) {
     if (!enabled) { iconButton(dc, r, icon, text, false, false); return; }
-    const COLORREF fill = hot ? mixc(C_GOLD, C_TEXT, 0.25) : C_GOLD;
+    const double k = hotLevelFor(r, hot);
+    const COLORREF fill = mixc(mixc(C_GOLD, mixc(C_GOLD, C_TEXT, 0.25), k), C_TEXT, 0.35 * pressLevelFor(r));
     buttonFace(dc, r, icon, text, fill, fill, C_BACK);
 }
 
@@ -3871,6 +4594,28 @@ static void drawLevelStrip(HDC dc, const RECT& s) {
     SelectObject(dc, of);
 }
 
+static double sbShown = -1.0, sbHeld = 0.0;
+
+static bool presetBarStep(double ms) {
+    if (!hPreset) return false;
+    const double top = (double)SendMessageW(hPreset, LB_GETTOPINDEX, 0, 0);
+    bool moved = false;
+    if (sbShown < 0.0 || sbDragOff >= 0 || !uiAnim) {
+        moved = sbShown != top;
+        sbShown = top;
+    } else if (sbShown != top) {
+        sbShown += (top - sbShown) * (1.0 - std::exp(-ms / 45.0));
+        if (std::fabs(top - sbShown) < 0.01) sbShown = top;
+        moved = true;
+    }
+    const double want = sbDragOff >= 0 ? 1.0 : 0.0;
+    if (sbHeld != want) {
+        sbHeld = want > sbHeld ? std::min(want, sbHeld + (uiAnim ? ms / 90.0 : 1.0)) : std::max(want, sbHeld - (uiAnim ? ms / 220.0 : 1.0));
+        moved = true;
+    }
+    return moved;
+}
+
 static void drawPresetScrollbar(HDC dc) {
     if (!hPreset) return;
     const int total = (int)SendMessageW(hPreset, LB_GETCOUNT, 0, 0);
@@ -3884,7 +4629,13 @@ static void drawPresetScrollbar(HDC dc) {
     gr.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     roundBox(gr, x + 0.5f, y + 0.5f, sw - 1.0f, sh - 1.0f, 5.0f, C_BACK, alphaFor(C_BACK), C_EDGE);
     auto chevron = [&](float cy, bool up, bool on) {
-        Gdiplus::Pen pen(gpColor(on ? C_DIM : C_EDGE), 1.6f);
+        const RECT& part = up ? R_SB_UP : R_SB_DOWN;
+        const double hk = on ? hotLevelFor(part, isHot(part)) : 0.0, pad = std::max(0.55 * hk, pressLevelFor(part));
+        if (pad > 0.0) {
+            const COLORREF fill = mixc(C_BACK, C_NAVY, pad);
+            roundBox(gr, x + 2.0f, cy - AH / 2.0f + 2.0f, sw - 4.0f, AH - 4.0f, 3.0f, fill, fadeAlpha(pad), fill);
+        }
+        Gdiplus::Pen pen(gpColor(mixc(on ? C_DIM : C_EDGE, C_GOLD, hk)), 1.6f);
         pen.SetStartCap(Gdiplus::LineCapRound);
         pen.SetEndCap(Gdiplus::LineCapRound);
         pen.SetLineJoin(Gdiplus::LineJoinRound);
@@ -3898,9 +4649,13 @@ static void drawPresetScrollbar(HDC dc) {
         const int trackH = sh - 2 * AH;
         const int thumbH = max(AH, trackH * vis / total);
         const int maxTop = total - vis;
-        const int thumbY = maxTop > 0 ? (int)((long long)top * (trackH - thumbH) / maxTop) : 0;
-        roundBox(gr, x + 2.5f, (float)(y + AH + thumbY), sw - 5.0f, (float)thumbH, (sw - 5.0f) / 2.0f,
-                 mixc(C_NAVY, C_GOLD, sbDragOff >= 0 ? 0.55 : 0.30), 255, C_NAVY);
+        const double shown = sbShown < 0.0 || !uiAnim || sbDragOff >= 0 ? (double)top : std::min((double)maxTop, std::max(0.0, sbShown));
+        const float thumbY = maxTop <= 0 ? 0.0f : (shown == (double)top ? (float)((long long)top * (trackH - thumbH) / maxTop) : (float)(shown * (trackH - thumbH) / maxTop));
+        const double lift = 0.30 + 0.12 * hotLevelFor(R_SB_TRACK, isHot(R_SB_TRACK));
+        const double held = uiAnim ? sbHeld : (sbDragOff >= 0 ? 1.0 : 0.0);
+        const double shade = lift + (0.55 - lift) * std::max(held, 0.7 * pressLevelFor(R_SB_TRACK));
+        roundBox(gr, x + 2.5f, y + AH + thumbY, sw - 5.0f, (float)thumbH, (sw - 5.0f) / 2.0f,
+                 mixc(C_NAVY, C_GOLD, shade), 255, C_NAVY);
     }
 }
 
@@ -4141,7 +4896,7 @@ static void drawCablePanel(HDC dc, const RECT&) {
                   isHot(R_CB_RUN), !busy);
     iconButton(dc, R_CB_FOLDER, ICO_OPEN, L"Open folder", isHot(R_CB_FOLDER), !cableSetup().empty());
     iconButton(dc, R_CB_BACK, ICO_PREV, L"Back", isHot(R_CB_BACK));
-    label(dc, R_CB_SITE.left, R_CB_SITE.top, L"vb-audio.com/Cable", isHot(R_CB_SITE) ? C_TEXT : C_GOLD, fntBold);
+    label(dc, R_CB_SITE.left, R_CB_SITE.top, L"vb-audio.com/Cable", mixc(C_GOLD, C_TEXT, hotLevelFor(R_CB_SITE, isHot(R_CB_SITE))), fntBold);
     label(dc, CARD_X, R_CB_SITE.bottom + 10, L"VB-CABLE is donationware made by VB-Audio Software.", C_DIM, fntUI);
 }
 
@@ -4170,9 +4925,9 @@ static const RECT R_VSPEED = {114, VOICE_Y + 96, 230, VOICE_Y + 118};
 static const RECT R_VKEEP  = {284, VOICE_Y + 100, 364, VOICE_Y + 115};
 static const RECT R_VLAG   = {392, VOICE_Y + 98, 542, VOICE_Y + 117};
 static const wchar_t* const KEEP_PITCH = L"Keep pitch";
-static const RECT R_GLITCH = {110, VOICE_Y + 128, 304, VOICE_Y + 152};
-static const RECT R_GLITCH_BOX = {310, VOICE_Y + 128, 420, VOICE_Y + 152};
-static const RECT R_GLITCH_KEY = {426, VOICE_Y + 128, 452, VOICE_Y + 152};
+static const RECT R_GLITCH = {110, VOICE_Y + 131, 304, VOICE_Y + 155};
+static const RECT R_GLITCH_BOX = {310, VOICE_Y + 131, 420, VOICE_Y + 155};
+static const RECT R_GLITCH_KEY = {426, VOICE_Y + 131, 452, VOICE_Y + 155};
 static bool glitchListening = false;
 static std::wstring glitchNote;
 static ULONGLONG glitchNoteAt = 0;
@@ -4586,7 +5341,7 @@ static void drawEqPanel(HDC dc) {
         else if (live > 0) swprintf_s(t, 64, L"%d \u2192 %d Hz", live, g.voiceTargetHz.load());
         else wcscpy_s(t, L"on");
         {
-            RECT st = {460, VOICE_Y + 132, 540, VOICE_Y + 149};
+            RECT st = {460, VOICE_Y + 135, 540, VOICE_Y + 152};
             SetTextColor(dc, C_DIM);
             SetBkMode(dc, TRANSPARENT);
             HGDIOBJ of = SelectObject(dc, fntUI);
@@ -4596,7 +5351,7 @@ static void drawEqPanel(HDC dc) {
         {
             const bool held = g.glitchHold.load() || g.glitchKeyHeld.load();
             const voice::GlitchLook& gl = voice::GLITCH_LOOKS[glitchIndex()];
-            label(dc, 24, VOICE_Y + 133, L"Glitch", C_DIM, fntUI);
+            label(dc, 24, VOICE_Y + 136, L"Glitch", C_DIM, fntUI);
             const int gk = g.glitchKey.load();
             std::wstring text = held ? gl.busy : gl.idle;
             if (glitchListening) text = L"Press a key or mouse button";
@@ -5615,9 +6370,10 @@ static void colFromPt(POINT p, bool hue) {
     }
 }
 
-static void drawColField(HDC dc) {
-    const int w = R_COL_SV.right - R_COL_SV.left;
-    const int h = R_COL_SV.bottom - R_COL_SV.top;
+template <typename Shade>
+static void paintField(HDC dc, const RECT& d, Shade shade) {
+    const int w = d.right - d.left, h = d.bottom - d.top;
+    if (w < 1 || h < 1) return;
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bi.bmiHeader.biWidth = w;
@@ -5627,60 +6383,53 @@ static void drawColField(HDC dc) {
     bi.bmiHeader.biCompression = BI_RGB;
     void* bits = nullptr;
     HDC mem = CreateCompatibleDC(dc);
-    HBITMAP hb = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HBITMAP hb = mem ? CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
     if (hb && bits) {
-        unsigned char* px = (unsigned char*)bits;
-        for (int y = 0; y < h; ++y) {
-            const float vv = h > 1 ? 1.f - (float)y / (float)(h - 1) : 1.f;
+        uint32_t* px = (uint32_t*)bits;
+        for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x) {
-                COLORREF c = hsvRgb(colH, w > 1 ? (float)x / (float)(w - 1) : 0, vv);
-                const int o = (y * w + x) * 4;
-                px[o] = GetBValue(c); px[o + 1] = GetGValue(c); px[o + 2] = GetRValue(c); px[o + 3] = 255;
+                const COLORREF c = shade(x, y, w, h);
+                px[(size_t)y * w + x] = 0xFF000000u | (uint32_t)GetRValue(c) << 16 | (uint32_t)GetGValue(c) << 8 | GetBValue(c);
             }
-        }
         HGDIOBJ old = SelectObject(mem, hb);
-        BitBlt(dc, R_COL_SV.left, R_COL_SV.top, w, h, mem, 0, 0, SRCCOPY);
+        BitBlt(dc, d.left, d.top, w, h, mem, 0, 0, SRCCOPY);
         SelectObject(mem, old);
     }
     if (hb) DeleteObject(hb);
-    DeleteDC(mem);
-    HPEN pe = linePen(C_EDGE);
-    HGDIOBJ op = SelectObject(dc, pe);
-    HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
-    frame(dc, R_COL_SV.left, R_COL_SV.top, R_COL_SV.right, R_COL_SV.bottom);
+    if (mem) DeleteDC(mem);
+}
+
+static void drawColField(HDC dc) {
+    {
+        PixelSnap px(dc);
+        const RECT sv = px.map(R_COL_SV), hue = px.map(R_COL_HUE);
+        paintField(dc, sv, [](int x, int y, int w, int h) {
+            return hsvRgb(colH, w > 1 ? (float)x / (float)(w - 1) : 0.f, h > 1 ? 1.f - (float)y / (float)(h - 1) : 1.f);
+        });
+        paintField(dc, hue, [](int, int y, int, int h) { return hsvRgb(h > 1 ? (float)y / (float)(h - 1) : 0.f, 1.f, 1.f); });
+        edgeLines(dc, sv, px.line(), C_EDGE);
+        edgeLines(dc, hue, px.line(), C_EDGE);
+    }
+    const int w = R_COL_SV.right - R_COL_SV.left;
+    const int h = R_COL_SV.bottom - R_COL_SV.top;
     const int cx = R_COL_SV.left + (int)(colS * (w - 1));
     const int cy = R_COL_SV.top + (int)((1.f - colV) * (h - 1));
     HPEN wp = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
-    SelectObject(dc, wp);
+    HGDIOBJ op = SelectObject(dc, wp);
+    HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
     Ellipse(dc, cx - 6, cy - 6, cx + 7, cy + 7);
-    SelectObject(dc, pe);
-    DeleteObject(wp);
     SelectObject(dc, op);
     SelectObject(dc, ob);
-    DeleteObject(pe);
+    DeleteObject(wp);
 
     const int hh = R_COL_HUE.bottom - R_COL_HUE.top;
-    for (int y = 0; y < hh; ++y) {
-        HPEN p = linePen(hsvRgb(hh > 1 ? (float)y / (float)(hh - 1) : 0, 1.f, 1.f));
-        HGDIOBJ o2 = SelectObject(dc, p);
-        MoveToEx(dc, R_COL_HUE.left, R_COL_HUE.top + y, nullptr);
-        LineTo(dc, R_COL_HUE.right, R_COL_HUE.top + y);
-        SelectObject(dc, o2);
-        DeleteObject(p);
-    }
-    HPEN he = linePen(C_EDGE);
-    op = SelectObject(dc, he);
-    ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
-    frame(dc, R_COL_HUE.left, R_COL_HUE.top, R_COL_HUE.right, R_COL_HUE.bottom);
     const int hy = R_COL_HUE.top + (int)(colH * (hh - 1));
     HPEN gp = CreatePen(PS_SOLID, 2, C_TEXT);
-    SelectObject(dc, gp);
+    op = SelectObject(dc, gp);
     MoveToEx(dc, R_COL_HUE.left - 3, hy, nullptr);
     LineTo(dc, R_COL_HUE.right + 3, hy);
     SelectObject(dc, op);
-    SelectObject(dc, ob);
     DeleteObject(gp);
-    DeleteObject(he);
 }
 
 static void paintColor(HDC dc, const RECT& rc) {
@@ -6425,28 +7174,50 @@ static void boxText(HDC dc, const RECT& r, const wchar_t* s, COLORREF c, HFONT f
     drawText(dc, s, -1, &rr, align | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     SelectObject(dc, of);
 }
+struct BoxFrame {
+    HWND wnd = nullptr;
+    DockImage img;
+};
+static std::vector<BoxFrame> boxFrames;
+
+static DockImage* boxFrameFor(HWND h, int w, int hh) {
+    for (size_t i = 0; i < boxFrames.size();) {
+        if (IsWindow(boxFrames[i].wnd)) {
+            ++i;
+            continue;
+        }
+        boxFrames[i].img.drop();
+        boxFrames.erase(boxFrames.begin() + (std::ptrdiff_t)i);
+    }
+    for (BoxFrame& b : boxFrames)
+        if (b.wnd == h) return b.img.make(w, hh) ? &b.img : nullptr;
+    boxFrames.push_back(BoxFrame{h, {}});
+    return boxFrames.back().img.make(w, hh) ? &boxFrames.back().img : nullptr;
+}
+
 static void paintBox(HWND h, void (*paintFn)(HDC, const RECT&)) {
     PAINTSTRUCT ps;
     HDC wdc = BeginPaint(h, &ps);
     RECT rc;
     GetClientRect(h, &rc);
-    HDC dc = CreateCompatibleDC(wdc);
-    HBITMAP bmp = dc ? backBuffer(rc.right, rc.bottom) : nullptr;
-    if (dc && bmp) {
-        HGDIOBJ ob = SelectObject(dc, bmp);
+    DockImage* frame = boxFrameFor(h, rc.right, rc.bottom);
+    if (frame) {
+        HDC dc = frame->dc;
         const RECT& d = ps.rcPaint;
+        SelectClipRgn(dc, nullptr);
         IntersectClipRect(dc, d.left, d.top, d.right, d.bottom);
         scaleDc(dc);
         boxPx = {rc.right, rc.bottom};
+        boxPainting = true;
         paintFn(dc, designRect(rc.right, rc.bottom));
+        boxPainting = false;
         flatDc(dc);
+        SelectClipRgn(dc, nullptr);
+        fadeApply(h, dc, d);
         BitBlt(wdc, d.left, d.top, d.right - d.left, d.bottom - d.top, dc, d.left, d.top, SRCCOPY);
-        SelectObject(dc, ob);
     } else {
         printBox(h, wdc, paintFn);
     }
-    if (bmp) DeleteObject(bmp);
-    if (dc) DeleteDC(dc);
     EndPaint(h, &ps);
 }
 
@@ -6455,7 +7226,9 @@ static void printBox(HWND h, HDC dc, void (*paintFn)(HDC, const RECT&)) {
     GetClientRect(h, &rc);
     scaleDc(dc);
     boxPx = {rc.right, rc.bottom};
+    boxPainting = true;
     paintFn(dc, designRect(rc.right, rc.bottom));
+    boxPainting = false;
     flatDc(dc);
 }
 static void boxTrackLeave(HWND h, bool& tracking) {
@@ -6600,25 +7373,21 @@ static void paintTonePad(HDC dc, bool live) {
     const bool held = toneDrag == TN_PAD, hot = held || toneHot == TN_PAD;
     panel(dc, r, C_BACK, hot ? C_GOLD : C_EDGE);
     const int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
-    HPEN grid = linePen(C_EDGE);
-    HGDIOBJ op = SelectObject(dc, grid);
-    for (int k = 1; k < 4; k += 2) {
-        const int x = r.left + (r.right - r.left) * k / 4, y = r.top + (r.bottom - r.top) * k / 4;
-        MoveToEx(dc, x, r.top + 1, nullptr);
-        LineTo(dc, x, r.bottom - 1);
-        MoveToEx(dc, r.left + 1, y, nullptr);
-        LineTo(dc, r.right - 1, y);
+    {
+        PixelSnap px(dc);
+        const RECT in = px.inside(r);
+        const int t = px.line();
+        auto cross = [&](int x, int y, COLORREF c) {
+            HBRUSH b = CreateSolidBrush(c);
+            const RECT down = {px.x((float)x), in.top, px.x((float)x) + t, in.bottom};
+            const RECT across = {in.left, px.y((float)y), in.right, px.y((float)y) + t};
+            FillRect(dc, &down, b);
+            FillRect(dc, &across, b);
+            DeleteObject(b);
+        };
+        for (int k = 1; k < 4; k += 2) cross(r.left + (r.right - r.left) * k / 4, r.top + (r.bottom - r.top) * k / 4, C_EDGE);
+        cross(cx, cy, C_DIM);
     }
-    SelectObject(dc, op);
-    DeleteObject(grid);
-    HPEN cross = linePen(C_DIM);
-    op = SelectObject(dc, cross);
-    MoveToEx(dc, cx, r.top + 1, nullptr);
-    LineTo(dc, cx, r.bottom - 1);
-    MoveToEx(dc, r.left + 1, cy, nullptr);
-    LineTo(dc, r.right - 1, cy);
-    SelectObject(dc, op);
-    DeleteObject(cross);
     const RECT top = {cx - 50, r.top + 4, cx + 50, r.top + 20}, bottom = {cx - 50, r.bottom - 20, cx + 50, r.bottom - 4};
     const RECT left = {r.left + 6, cy - 20, r.left + 60, cy - 4}, right = {r.right - 60, cy - 20, r.right - 6, cy - 4};
     boxText(dc, top, L"more mid", C_DIM, fntUI, DT_CENTER);
@@ -6850,9 +7619,9 @@ static LRESULT CALLBACK aboutProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             aboutMouse = true;
         }
         const POINT p = {(short)LOWORD(l), (short)HIWORD(l)};
-        RECT rc;
-        GetClientRect(h, &rc);
-        const RECT done = aboutOk(rc);
+        RECT dev;
+        GetClientRect(h, &dev);
+        const RECT done = aboutOk(designRect(dev.right, dev.bottom));
         const int hot = PtInRect(&done, p) ? 1 : (PtInRect(&aboutLink, p) ? 2 : (PtInRect(&R_AB_CLOSE, p) ? 3 : 0));
         if (hot != aboutHot) {
             aboutHot = hot;
@@ -6875,9 +7644,9 @@ static LRESULT CALLBACK aboutProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         break;
     case WM_LBUTTONDOWN: {
         const POINT p = {(short)LOWORD(l), (short)HIWORD(l)};
-        RECT rc;
-        GetClientRect(h, &rc);
-        const RECT done = aboutOk(rc);
+        RECT dev;
+        GetClientRect(h, &dev);
+        const RECT done = aboutOk(designRect(dev.right, dev.bottom));
         if (PtInRect(&done, p) || PtInRect(&R_AB_CLOSE, p)) aboutResult = 1;
         else if (PtInRect(&aboutLink, p)) ShellExecuteW(nullptr, L"open", ABOLHB_SITE, nullptr, nullptr, SW_SHOWNORMAL);
         else if (p.y < TITLE_H) { ReleaseCapture(); SendMessageW(h, WM_NCLBUTTONDOWN, HTCAPTION, 0); }
@@ -6916,20 +7685,33 @@ static void showAbout(HWND owner) {
 
 static void paintStripOnly(HDC wdc) {
     const RECT strip = stripRect();
-    const RECT dev = scRect(strip);
-    const int sw = strip.right - strip.left, sh = strip.bottom - strip.top;
+    const RECT dev = {sc(strip.left), (LONG)std::ceil(strip.top * uiScale - 0.001f), sc(strip.right), (LONG)std::floor(strip.bottom * uiScale + 0.001f)};
     const int dw = dev.right - dev.left, dh = dev.bottom - dev.top;
     HDC mdc = CreateCompatibleDC(wdc);
     HBITMAP mb = mdc ? backBuffer(dw, dh) : nullptr;
     if (mdc && mb) {
         HGDIOBJ om = SelectObject(mdc, mb);
-        scaleDc(mdc);
-        const RECT local = {0, 0, sw, sh};
+        const RECT whole = {0, 0, dw, dh};
         HBRUSH bg = CreateSolidBrush(C_BACK);
-        FillRect(mdc, &local, bg);
+        FillRect(mdc, &whole, bg);
         DeleteObject(bg);
-        drawWallpaper(mdc, local, strip.top);
-        drawLevelStrip(mdc, local);
+        if (wallBmp) {
+            HDC mem = CreateCompatibleDC(mdc);
+            HGDIOBJ ow = SelectObject(mem, wallBmp);
+            const int fullW = sc(WIN_W), fullH = sc(WIN_H);
+            if (wallW == fullW && wallH == fullH) {
+                BitBlt(mdc, 0, 0, dw, dh, mem, dev.left, dev.top, SRCCOPY);
+            } else {
+                SetStretchBltMode(mdc, HALFTONE);
+                StretchBlt(mdc, 0, 0, dw, dh, mem, dev.left * wallW / fullW, dev.top * wallH / fullH, dw * wallW / fullW, dh * wallH / fullH, SRCCOPY);
+            }
+            SelectObject(mem, ow);
+            DeleteDC(mem);
+        }
+        SetGraphicsMode(mdc, GM_ADVANCED);
+        const XFORM fit = {uiScale, 0.0f, 0.0f, uiScale, -(float)dev.left, -(float)dev.top};
+        SetWorldTransform(mdc, &fit);
+        drawLevelStrip(mdc, strip);
         flatDc(mdc);
         BitBlt(wdc, dev.left, dev.top, dw, dh, mdc, 0, 0, SRCCOPY);
         SelectObject(mdc, om);
@@ -7052,7 +7834,7 @@ static const RECT RB_CLEAR = {372, RB_LIST.top + 140, BOARD_W - 24, RB_LIST.top 
 static const RECT RB_STOP = {372, RB_LIST.top + 168, 452, RB_LIST.top + 192};
 static const RECT RB_STOPKEY = {456, RB_LIST.top + 168, BOARD_W - 24, RB_LIST.top + 192};
 static const RECT RB_NOTE = {16, BOARD_H - 30, BOARD_W - 16, BOARD_H - 4};
-enum { BH_NONE = -1, BH_CLOSE = 100, BH_ADD, BH_REMOVE, BH_PUT, BH_TRIM, BH_KEY, BH_CLEAR, BH_STOP, BH_RENAME, BH_STOPKEY };
+enum { BH_NONE = -1, BH_CLOSE = 100, BH_ADD, BH_REMOVE, BH_PUT, BH_TRIM, BH_KEY, BH_CLEAR, BH_STOP, BH_RENAME, BH_STOPKEY, BH_SCROLL, BH_ROW = 200 };
 
 struct BoardPad {
     std::wstring path, name;
@@ -7525,7 +8307,79 @@ static void boardAdd(HWND owner) {
     boardSave();
 }
 
+static double boardShown = 0.0, boardGlideAt = 0.0;
+static int boardDragOff = -1;
+static bool boardGliding = false;
+static const UINT_PTR BOARD_GLIDE_TIMER = 2;
+
+static bool boardScrolls() { return (int)boardFiles.size() > BOARD_ROWS; }
+
+static RECT boardTrack() { return RECT{RB_LIST.right - 8, RB_LIST.top + 2, RB_LIST.right - 2, RB_LIST.bottom - 2}; }
+
+static RECT boardThumb(double top) {
+    const RECT track = boardTrack();
+    const int span = (int)(track.bottom - track.top), total = (int)boardFiles.size();
+    const int h = std::max(14, span * BOARD_ROWS / std::max(1, total));
+    const LONG y = track.top + (LONG)std::lround((span - h) * top / std::max(1, total - BOARD_ROWS));
+    return RECT{track.left + 1, y, track.right - 1, y + h};
+}
+
+static void boardHoverRefresh(HWND h);
+
+static void boardGlide(HWND h) {
+    if (!uiAnim) {
+        boardShown = boardTop;
+        boardHoverRefresh(h);
+        return;
+    }
+    fadeDrop(h);
+    if (!boardGliding) boardGlideAt = fxNow();
+    boardGliding = true;
+    SetTimer(h, BOARD_GLIDE_TIMER, 10, nullptr);
+}
+
+static int boardHit(POINT p);
+
+static void boardHoverRefresh(HWND h) {
+    POINT c;
+    RECT cl;
+    if (!GetCursorPos(&c) || !ScreenToClient(h, &c) || !GetClientRect(h, &cl) || !PtInRect(&cl, c)) return;
+    const int hit = boardHit(POINT{unsc(c.x), unsc(c.y)});
+    if (hit == boardHot) return;
+    const bool watch = hoverWatch(h, WM_MOUSELEAVE, 0);
+    boardHot = hit;
+    InvalidateRect(h, nullptr, FALSE);
+    if (watch) hoverFade(h);
+}
+
+static void boardGlideStep(HWND h) {
+    const double now = fxNow(), ms = now - boardGlideAt;
+    boardGlideAt = now;
+    if (boardDragOff >= 0 || !uiAnim || std::fabs(boardTop - boardShown) < 0.01) {
+        boardShown = boardTop;
+        boardGliding = false;
+        KillTimer(h, BOARD_GLIDE_TIMER);
+        boardHoverRefresh(h);
+    } else {
+        boardShown += (boardTop - boardShown) * (1.0 - std::exp(-ms / 45.0));
+    }
+    invalidateDesign(h, RB_LIST);
+}
+
+static int boardRowAt(POINT p) {
+    if (!PtInRect(&RB_LIST, p) || p.y <= RB_LIST.top) return -1;
+    const double shown = boardGliding ? std::max(0.0, boardShown) : (double)boardTop;
+    const int first = (int)shown, lift = (int)std::lround((shown - first) * BOARD_ROW_H);
+    const int idx = first + (int)(p.y - RB_LIST.top - 1 + lift) / BOARD_ROW_H;
+    return idx >= 0 && idx < (int)boardFiles.size() ? idx : -1;
+}
+
 static int boardHit(POINT p) {
+    if (PtInRect(&RB_LIST, p) && !boardFiles.empty()) {
+        if (boardScrolls() && p.x >= boardTrack().left - 1) return BH_SCROLL;
+        const int idx = boardRowAt(p);
+        return idx >= 0 ? BH_ROW + idx : BH_NONE;
+    }
     for (int i = 0; i < BOARD_PADS; ++i) {
         const RECT r = boardPadRect(i);
         if (PtInRect(&r, p)) return i;
@@ -7591,25 +8445,38 @@ static void paintBoard(HDC dc, const RECT& rc) {
     if (boardFiles.empty()) {
         centredText(dc, RB_LIST, L"Press Add sounds to pick sound files", C_DIM, fntUI);
     } else {
-        const bool scroll = (int)boardFiles.size() > BOARD_ROWS;
-        for (int k = 0; k < BOARD_ROWS; ++k) {
-            const int idx = boardTop + k;
+        const bool scroll = boardScrolls();
+        if (!boardGliding || !scroll) boardShown = boardTop;
+        const double shown = std::min((double)std::max(0, (int)boardFiles.size() - BOARD_ROWS), std::max(0.0, boardShown));
+        const int first = (int)shown, lift = (int)std::lround((shown - first) * BOARD_ROW_H);
+        const int hovered = boardHot >= BH_ROW ? boardHot - BH_ROW : -1;
+        const int saved = SaveDC(dc);
+        IntersectClipRect(dc, RB_LIST.left + 1, RB_LIST.top + 1, RB_LIST.right - 1, RB_LIST.bottom - 1);
+        for (int k = 0; k <= BOARD_ROWS; ++k) {
+            const int idx = first + k;
             if (idx >= (int)boardFiles.size()) break;
-            RECT row = {RB_LIST.left + 1, RB_LIST.top + 1 + k * BOARD_ROW_H, RB_LIST.right - (scroll ? 9 : 1), RB_LIST.top + 1 + (k + 1) * BOARD_ROW_H - 1};
-            if (idx == boardRow) blendRect(dc, row, C_NAVY, 255);
+            const LONG top = RB_LIST.top + 1 + k * BOARD_ROW_H - lift;
+            RECT row = {RB_LIST.left + 1, top, RB_LIST.right - (scroll ? 9 : 1), top + BOARD_ROW_H - 1};
+            if (idx == boardRow || idx == hovered) {
+                PixelSnap px(dc);
+                const RECT in = px.inside(RB_LIST);
+                const RECT lit = {in.left, std::max(in.top, px.y((float)row.top)), scroll ? px.x((float)row.right) : in.right,
+                                  std::min(in.bottom, px.y((float)row.bottom))};
+                blendRect(dc, lit, idx == boardRow ? C_NAVY : mixc(C_BACK, C_NAVY, 0.45), 255);
+            }
             RECT tx = {row.left + 8, row.top, row.right - 6, row.bottom};
             SetTextColor(dc, idx == boardRow ? C_GOLD : C_TEXT);
             HGDIOBJ of = SelectObject(dc, fntUI);
             drawText(dc, fileTitle(boardFiles[(size_t)idx]).c_str(), -1, &tx, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
             SelectObject(dc, of);
         }
+        RestoreDC(dc, saved);
         if (scroll) {
-            const RECT track = {RB_LIST.right - 8, RB_LIST.top + 2, RB_LIST.right - 2, RB_LIST.bottom - 2};
+            const RECT track = boardTrack();
             blendRect(dc, track, C_PANEL, 255);
-            const int span = track.bottom - track.top, total = (int)boardFiles.size();
-            const int h = std::max(14, span * BOARD_ROWS / total), y = track.top + (span - h) * boardTop / (total - BOARD_ROWS);
-            const RECT thumb = {track.left + 1, y, track.right - 1, y + h};
-            blendRect(dc, thumb, mixc(C_NAVY, C_GOLD, 0.30), 255);
+            const double shade = boardDragOff >= 0 ? 0.55 : (boardHot == BH_SCROLL ? 0.42 : 0.30);
+            const RECT thumb = boardThumb(shown);
+            blendRect(dc, thumb, mixc(C_NAVY, C_GOLD, shade), 255);
         }
     }
     const bool row = boardRow >= 0 && boardRow < (int)boardFiles.size();
@@ -7950,14 +8817,17 @@ static void drawWaveBar(HDC dc, const WaveEdit& w) {
     const int top = w.bar.top + 1, bottom = w.bar.bottom - 1;
     if (w.zoomed()) {
         const int a = w.barX(w.viewAt), b = std::max(a + 3, w.barX(w.viewAt + w.viewLen));
-        blendRect(dc, RECT{a, top, b, bottom}, mixc(C_NAVY, C_GOLD, 0.30), 255);
+        PixelSnap px(dc);
+        const RECT in = px.inside(w.bar);
+        blendRect(dc, RECT{std::max(in.left, px.x((float)a)), in.top, std::min(in.right, px.x((float)b)), in.bottom}, mixc(C_NAVY, C_GOLD, 0.30), 255);
     }
     const int a = w.barX(w.from), b = std::max(a + 2, w.barX(w.to));
     blendRect(dc, RECT{a, top + 2, b, bottom - 2}, C_GOLD, 255);
 }
 
-static void valueBox(HDC dc, const RECT& r, const std::wstring& text, bool on, bool hot) {
-    panel(dc, r, hot ? C_NAVY : C_BACK, hot ? C_GOLD : C_EDGE);
+static void valueBox(HDC dc, const RECT& r, const std::wstring& text, bool on, bool hot, bool enabled = true) {
+    const double k = enabled ? hotLevelFor(r, hot) : 0.0;
+    panel(dc, r, mixc(C_BACK, C_NAVY, k), mixc(C_EDGE, C_GOLD, k), fadeAlpha(k));
     RECT tr = {r.left + 6, r.top, r.right - 4, r.bottom};
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, on ? C_TEXT : C_DIM);
@@ -8698,6 +9568,10 @@ static LRESULT CALLBACK boardProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         paintBox(h, paintBoard);
         return 0;
     case WM_TIMER:
+        if (w == BOARD_GLIDE_TIMER) {
+            boardGlideStep(h);
+            return 0;
+        }
         if (gBoard.playing() != boardLit) {
             boardLit = gBoard.playing();
             InvalidateRect(h, nullptr, FALSE);
@@ -8710,6 +9584,18 @@ static LRESULT CALLBACK boardProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             boardMouse = true;
         }
         const POINT p = {(short)LOWORD(l), (short)HIWORD(l)};
+        if (boardDragOff >= 0) {
+            const RECT track = boardTrack(), thumb = boardThumb(0.0);
+            const int room = std::max(1, (int)(track.bottom - track.top) - (int)(thumb.bottom - thumb.top));
+            const int most = std::max(0, (int)boardFiles.size() - BOARD_ROWS);
+            const int top = std::max(0, std::min(most, (int)std::lround((double)(p.y - boardDragOff - track.top) * most / room)));
+            if (top != boardTop) {
+                boardTop = top;
+                boardShown = top;
+                invalidateDesign(h, RB_LIST);
+            }
+            return 0;
+        }
         const int hit = boardHit(p);
         if (hit != boardHot) {
             boardHot = hit;
@@ -8722,12 +9608,38 @@ static LRESULT CALLBACK boardProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         boardHot = BH_NONE;
         InvalidateRect(h, nullptr, FALSE);
         return 0;
+    case WM_LBUTTONUP:
+        if (boardDragOff >= 0) {
+            boardDragOff = -1;
+            ReleaseCapture();
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        return 0;
+    case WM_CAPTURECHANGED:
+        if (boardDragOff >= 0) {
+            boardDragOff = -1;
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        return 0;
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK: {
         const POINT p = {(short)LOWORD(l), (short)HIWORD(l)};
         boardRenameEnd(true);
+        if (PtInRect(&RB_LIST, p) && boardScrolls() && p.x >= boardTrack().left - 1) {
+            const RECT thumb = boardThumb(boardTop);
+            if (p.y >= thumb.top && p.y < thumb.bottom) {
+                boardDragOff = (int)(p.y - thumb.top);
+                SetCapture(h);
+            } else {
+                const int most = std::max(0, (int)boardFiles.size() - BOARD_ROWS);
+                boardTop = std::max(0, std::min(most, boardTop + (p.y < thumb.top ? 1 - BOARD_ROWS : BOARD_ROWS - 1)));
+                boardGlide(h);
+            }
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
         if (PtInRect(&RB_LIST, p)) {
-            const int idx = boardTop + (p.y - RB_LIST.top - 1) / BOARD_ROW_H;
+            const int idx = boardRowAt(p);
             if (idx >= 0 && idx < (int)boardFiles.size()) {
                 boardRow = idx;
                 if (m == WM_LBUTTONDBLCLK) boardPut();
@@ -8752,6 +9664,7 @@ static LRESULT CALLBACK boardProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (PtInRect(&RB_LIST, p)) {
             const int most = std::max(0, (int)boardFiles.size() - BOARD_ROWS);
             boardTop = std::max(0, std::min(most, boardTop - GET_WHEEL_DELTA_WPARAM(w) / WHEEL_DELTA));
+            boardGlide(h);
             InvalidateRect(h, nullptr, FALSE);
         }
         return 0;
@@ -8792,6 +9705,9 @@ static LRESULT CALLBACK boardProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         hBoard = nullptr;
         boardMouse = false;
         boardHot = BH_NONE;
+        boardDragOff = -1;
+        boardGliding = false;
+        boardShown = boardTop;
         return 0;
     }
     return DefWindowProcW(h, m, w, l);
@@ -9831,10 +10747,10 @@ static void drawRecorder(HDC dc) {
         SelectObject(dc, of);
     }
     iconButton(dc, R_REC_FIN_PREV, ICO_PREV, nullptr, isHot(R_REC_FIN_PREV), ready);
-    valueBox(dc, R_REC_FIN, fadeText(take.fadeIn), ready && take.fadeIn > 0.0, ready && isHot(R_REC_FIN));
+    valueBox(dc, R_REC_FIN, fadeText(take.fadeIn), ready && take.fadeIn > 0.0, isHot(R_REC_FIN), ready);
     iconButton(dc, R_REC_FIN_NEXT, ICO_NEXT, nullptr, isHot(R_REC_FIN_NEXT), ready);
     iconButton(dc, R_REC_FOUT_PREV, ICO_PREV, nullptr, isHot(R_REC_FOUT_PREV), ready);
-    valueBox(dc, R_REC_FOUT, fadeText(take.fadeOut), ready && take.fadeOut > 0.0, ready && isHot(R_REC_FOUT));
+    valueBox(dc, R_REC_FOUT, fadeText(take.fadeOut), ready && take.fadeOut > 0.0, isHot(R_REC_FOUT), ready);
     iconButton(dc, R_REC_FOUT_NEXT, ICO_NEXT, nullptr, isHot(R_REC_FOUT_NEXT), ready);
 }
 
@@ -9975,12 +10891,10 @@ static void drawTitleBar(HDC dc, const RECT& rc, bool mainView) {
     }
     iconButton(dc, R_GEAR, ICO_LOOK, nullptr, isHot(R_GEAR));
     iconButton(dc, R_MIN, ICO_MIN, nullptr, isHot(R_MIN));
-    if (isHot(R_CLOSE)) {
+    {
+        const double k = hotLevelFor(R_CLOSE, isHot(R_CLOSE));
         const COLORREF red = RGB(200, 58, 72);
-        panel(dc, R_CLOSE, red, red);
-        drawIcon(dc, (R_CLOSE.left + R_CLOSE.right) / 2.0f, (R_CLOSE.top + R_CLOSE.bottom) / 2.0f, ICO_CLOSE, RGB(255, 255, 255), red);
-    } else {
-        iconButton(dc, R_CLOSE, ICO_CLOSE, nullptr, false);
+        buttonFace(dc, R_CLOSE, ICO_CLOSE, nullptr, mixc(C_BACK, red, k), mixc(C_EDGE, red, k), mixc(C_TEXT, RGB(255, 255, 255), k), fadeAlpha(k));
     }
 }
 
@@ -10138,9 +11052,9 @@ static void drawStatusBar(HDC dc, const RECT& rc) {
             SelectObject(dc, of);
         }
     }
-    label(dc, cx, cy, cr.c_str(), isHot(rCredit) ? C_GOLD : C_DIM, fntUI);
+    label(dc, cx, cy, cr.c_str(), mixc(C_DIM, C_GOLD, hotLevelFor(rCredit, isHot(rCredit))), fntUI);
     {
-        HPEN grip = linePen(isHot(R_GRIP) || zoomDrag ? C_GOLD : C_DIM);
+        HPEN grip = linePen(zoomDrag ? C_GOLD : mixc(C_DIM, C_GOLD, hotLevelFor(R_GRIP, isHot(R_GRIP))));
         HGDIOBJ og = SelectObject(dc, grip);
         for (int k = 4; k <= 12; k += 4) {
             MoveToEx(dc, R_GRIP.right - 1, R_GRIP.bottom - 1 - k, nullptr);
@@ -10197,8 +11111,12 @@ static void paint(HWND hwnd) {
     if (RectVisible(dc, &statusBox)) drawStatusBar(dc, rc);
 
     if (mainView) {
-        const RECT presetBox = {PRESET_X - 1, PRESET_Y - 1, PRESET_X + PRESET_LW + 1, PRESET_Y + PRESET_H + 1};
-        outline(dc, presetBox, C_EDGE);
+        {
+            PixelSnap px(dc);
+            RECT presetBox = px.map(RECT{PRESET_X, PRESET_Y, PRESET_X + PRESET_LW, PRESET_Y + PRESET_H});
+            InflateRect(&presetBox, px.line(), px.line());
+            edgeLines(dc, presetBox, px.line(), C_EDGE);
+        }
         drawPresetScrollbar(dc);
     }
 
@@ -10206,6 +11124,7 @@ static void paint(HWND hwnd) {
     SelectClipRgn(dc, nullptr);
     if (buffered) {
         const RECT& d = ps.rcPaint;
+        fadeApply(hwnd, dc, d);
         BitBlt(wdc, d.left, d.top, d.right - d.left, d.bottom - d.top, dc, d.left, d.top, SRCCOPY);
     }
     EndPaint(hwnd, &ps);
@@ -10213,8 +11132,10 @@ static void paint(HWND hwnd) {
 
 static void drawItem(LPDRAWITEMSTRUCT d) {
     if (d->itemID == (UINT)-1) return;
-    bool sel = (d->itemState & ODS_SELECTED) != 0;
-    HBRUSH b = CreateSolidBrush(sel ? C_NAVY : C_BACK);
+    const bool sel = (d->itemState & ODS_SELECTED) != 0;
+    const HWND list = d->hwndItem == hPreset ? hPreset : ((d->itemState & ODS_COMBOBOXEDIT) ? nullptr : dropListOf(d->hwndItem));
+    const double k = shineSel(list, (int)d->itemID, sel), over = shineOver(list, (int)d->itemID);
+    HBRUSH b = CreateSolidBrush(mixc(mixc(C_BACK, C_NAVY, 0.45 * over), C_NAVY, k));
     FillRect(d->hDC, &d->rcItem, b);
     DeleteObject(b);
 
@@ -10240,7 +11161,7 @@ static void drawItem(LPDRAWITEMSTRUCT d) {
         if ((int)i < voice::NUM_GLITCH_STYLES) wcsncpy_s(txt, voice::GLITCH_LOOKS[i].name, 255);
     }
     SetBkMode(d->hDC, TRANSPARENT);
-    SetTextColor(d->hDC, sel ? C_GOLD : C_TEXT);
+    SetTextColor(d->hDC, mixc(C_TEXT, C_GOLD, k));
     HGDIOBJ of = SelectObject(d->hDC, fntCtl);
     RECT t = d->rcItem;
     t.left += sc(8);
@@ -10426,22 +11347,39 @@ static int knobAt(POINT p) {
 
 struct KnobGlide {
     bool on = false;
-    double from = 0.0, to = 0.0;
+    double from = 0.0, to = 0.0, ms = GLIDE_MS;
     ULONGLONG start = 0;
     HWND owner = nullptr;
 };
 static KnobGlide glides[K_COUNT];
+static const double WHEEL_GLIDE_MS = 130.0;
 
-static void glideKnobTo(HWND owner, int k, int to) {
+static void glideKnobTo(HWND owner, int k, int to, double ms = GLIDE_MS) {
     if (k < 0 || k >= K_COUNT) return;
     KnobGlide& gl = glides[k];
     gl.from = knobValue(k);
     gl.to = to;
+    gl.ms = ms;
     gl.on = gl.from != gl.to;
     if (!gl.on) return;
     gl.start = GetTickCount64();
     gl.owner = owner;
     SetTimer(owner, GLIDE_TIMER, 15, nullptr);
+}
+
+static int knobAim(int k) {
+    return k >= 0 && k < K_COUNT && glides[k].on ? (int)std::lround(glides[k].to) : knobValue(k);
+}
+
+static void wheelKnob(HWND h, int k, int to) {
+    if (uiAnim) {
+        glideKnobTo(h, k, to, WHEEL_GLIDE_MS);
+        if (!glides[k].on) knobSettle(k);
+        return;
+    }
+    knobSet(k, to);
+    knobSettle(k);
+    InvalidateRect(h, nullptr, FALSE);
 }
 
 static void glideKnob(HWND owner, int k) {
@@ -10463,7 +11401,7 @@ static bool glideStep(HWND owner) {
     for (int k = 0; k < K_COUNT; ++k) {
         KnobGlide& gl = glides[k];
         if (!gl.on || gl.owner != owner) continue;
-        const double t = std::min(1.0, (double)(now - gl.start) / GLIDE_MS);
+        const double t = std::min(1.0, (double)(now - gl.start) / gl.ms);
         const double ease = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
         knobSet(k, (int)std::lround(gl.from + (gl.to - gl.from) * ease));
         if (t >= 1.0) {
@@ -10846,15 +11784,24 @@ static HFONT uiFont(int height, int weight) {
     return faceFont(height, weight, uiFace.c_str());
 }
 
-static void makeCtlFonts() {
+static int ctlFontPx[4] = {0, 0, 0, 0};
+
+static bool ctlFontsFit() {
+    for (int i = 0; i < 4; ++i)
+        if (ctlFontPx[i] != sc(-typeEm[i])) return false;
+    return true;
+}
+
+static void makeCtlFonts(bool redraw = true) {
     HFONT oldPlain = fntCtl, oldBold = fntCtlBold, oldTitle = fntCtlTitle, oldId = fntCtlId;
-    fntCtl = uiFont(sc(-typeEm[0]), typeWeight(0));
-    fntCtlBold = uiFont(sc(-typeEm[1]), typeWeight(1));
-    fntCtlTitle = uiFont(sc(-typeEm[2]), typeWeight(2));
-    fntCtlId = uiFont(sc(-typeEm[3]), typeWeight(3));
+    for (int i = 0; i < 4; ++i) ctlFontPx[i] = sc(-typeEm[i]);
+    fntCtl = uiFont(ctlFontPx[0], typeWeight(0));
+    fntCtlBold = uiFont(ctlFontPx[1], typeWeight(1));
+    fntCtlTitle = uiFont(ctlFontPx[2], typeWeight(2));
+    fntCtlId = uiFont(ctlFontPx[3], typeWeight(3));
     for (HWND c : {hMic, hSpk, hPreset, hApp, hEqBox, hMaskBox, hOwnBox, hGlitchBox, hKey, hClipUrl, hTip, hPromptEdit, trim.fromBox, trim.toBox})
-        if (c) SendMessageW(c, WM_SETFONT, (WPARAM)fntCtl, TRUE);
-    if (boardEdit) SendMessageW(boardEdit, WM_SETFONT, (WPARAM)fntCtlBold, TRUE);
+        if (c) SendMessageW(c, WM_SETFONT, (WPARAM)fntCtl, redraw);
+    if (boardEdit) SendMessageW(boardEdit, WM_SETFONT, (WPARAM)fntCtlBold, redraw);
     if (oldPlain) DeleteObject(oldPlain);
     if (oldBold) DeleteObject(oldBold);
     if (oldTitle) DeleteObject(oldTitle);
@@ -10874,7 +11821,7 @@ static void makeFonts() {
 }
 
 static void placeChild(HWND c, int x, int y, int w, int h) {
-    if (c) MoveWindow(c, sc(x), sc(y), sc(x + w) - sc(x), sc(y + h) - sc(y), TRUE);
+    if (c) SetWindowPos(c, nullptr, sc(x), sc(y), sc(x + w) - sc(x), sc(y + h) - sc(y), SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS);
 }
 
 static void placeBox(HWND c, const RECT& r, int drop) {
@@ -10887,6 +11834,7 @@ static void placeBox(HWND c, const RECT& r, int drop) {
     GetWindowRect(c, &wr);
     const int frame = (int)(wr.bottom - wr.top) - want;
     if (frame > 0 && want > frame) SendMessageW(c, CB_SETITEMHEIGHT, (WPARAM)-1, want - frame);
+    primeDropList(c);
 }
 
 static void placeChildren() {
@@ -10905,7 +11853,7 @@ static void placeChildren() {
 
 static void applyScale(HWND h, float s, const POINT* at, bool live) {
     uiScale = s;
-    makeCtlFonts();
+    if (!live || !ctlFontsFit()) makeCtlFonts(false);
     placeChildren();
     tipsPlace();
     if (!live) {
@@ -10925,7 +11873,7 @@ static void applyScale(HWND h, float s, const POINT* at, bool live) {
         InvalidateRect(o.box, nullptr, FALSE);
     }
     if (boardEdit) boardRenameEnd(true);
-    InvalidateRect(h, nullptr, FALSE);
+    RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
 static void setUiType(const std::wstring& face, bool bold, int size) {
@@ -10943,21 +11891,276 @@ static void setUiType(const std::wstring& face, bool bold, int size) {
 
 static void setUiFace(const std::wstring& face) { setUiType(face, uiBold, uiSize); }
 
+static float zoomFit(HWND h, float pct) {
+    const float p = pct < ZOOM_MIN ? (float)ZOOM_MIN : (pct > ZOOM_MAX ? (float)ZOOM_MAX : pct);
+    return fitScale(uiDpi / 96.0f * p / 100.0f, workAreaOf(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST)));
+}
+
 static void setZoom(HWND h, int pct, bool live) {
     const float dpiK = uiDpi / 96.0f;
-    const float want = fitScale(dpiK * clampInt(pct, ZOOM_MIN, ZOOM_MAX) / 100.0f, workAreaOf(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST)));
+    const float want = zoomFit(h, (float)pct);
     uiZoom = live ? clampInt((int)lroundf(want / dpiK * 100.0f), ZOOM_MIN, ZOOM_MAX) : clampInt(pct, ZOOM_MIN, ZOOM_MAX);
     if (want != uiScale) applyScale(h, want, nullptr, live);
 }
 
 static POINT zoomOrigin = {0, 0};
 
-static void zoomDone(HWND h) {
-    zoomDrag = false;
-    settingsSave();
+static const UINT ZOOM_TIMER = 42;
+static const UINT WM_ZOOM_SETTLE = WM_APP + 47;
+static const double ZOOM_SPRING = 32.0, ZOOM_REST_MS = 150.0;
+
+struct ZoomGlide {
+    bool on = false, parked = false, stuck = false;
+    double at = 1.0, speed = 0.0, last = 0.0, aimed = 0.0;
+    float to = 1.0f, drawn = 0.0f;
+    HWND ghost = nullptr;
+    DockImage shot, frame;
+};
+static ZoomGlide zoomGlide;
+
+static void zoomFinish(HWND h) {
     applyLook();
     if (wallBmp && (wallW != sc(WIN_W) || wallH != sc(WIN_H))) buildBackground();
     InvalidateRect(h, nullptr, FALSE);
+}
+
+struct PictureScale {
+    const uint32_t* src;
+    int sw, sh;
+    uint32_t* dst;
+    int stride, dw, dh;
+    std::vector<int> xs, xf;
+
+    static uint32_t mix(uint32_t a, uint32_t b, uint32_t f) {
+        const uint32_t rb = (((a & 0xFF00FF) * (256 - f) + (b & 0xFF00FF) * f) >> 8) & 0xFF00FF;
+        const uint32_t g = (((a & 0x00FF00) * (256 - f) + (b & 0x00FF00) * f) >> 8) & 0x00FF00;
+        return rb | g;
+    }
+
+    static int place(int i, int from, int to, int& frac) {
+        long long f = (long long)(2 * i + 1) * from * 256 / (2 * to) - 128;
+        if (f < 0) f = 0;
+        int at = (int)(f >> 8);
+        frac = (int)(f & 255);
+        if (at >= from - 1) {
+            at = from - 1;
+            frac = 0;
+        }
+        return at;
+    }
+
+    void fillRow(uint32_t* row, int sy) const {
+        const uint32_t* s = src + (size_t)sy * sw;
+        for (int x = 0; x < dw; ++x) {
+            const int i = xs[x];
+            row[x] = mix(s[i], s[i + 1 < sw ? i + 1 : i], (uint32_t)xf[x]);
+        }
+    }
+
+    void rows(int y0, int y1) const {
+        std::vector<uint32_t> upper(dw), lower(dw);
+        int haveUpper = -1, haveLower = -1;
+        for (int y = y0; y < y1; ++y) {
+            int f = 0;
+            const int sy = place(y, sh, dh, f);
+            const int sy1 = sy + 1 < sh ? sy + 1 : sy;
+            if (haveUpper != sy) {
+                if (haveLower == sy) {
+                    upper.swap(lower);
+                    std::swap(haveUpper, haveLower);
+                } else {
+                    fillRow(upper.data(), sy);
+                    haveUpper = sy;
+                }
+            }
+            if (haveLower != sy1) {
+                fillRow(lower.data(), sy1);
+                haveLower = sy1;
+            }
+            uint32_t* d = dst + (size_t)y * stride;
+            for (int x = 0; x < dw; ++x) d[x] = mix(upper[x], lower[x], (uint32_t)f);
+        }
+    }
+
+    void run() {
+        xs.resize(dw);
+        xf.resize(dw);
+        for (int x = 0; x < dw; ++x) xs[x] = place(x, sw, dw, xf[x]);
+        const int parts = (size_t)dw * dh > 2000000 ? (int)std::min(4u, std::max(1u, std::thread::hardware_concurrency())) : 1;
+        std::vector<std::thread> helpers;
+        for (int t = 1; t < parts; ++t) {
+            try {
+                helpers.emplace_back([this, t, parts] { rows(dh * t / parts, dh * (t + 1) / parts); });
+            } catch (const std::system_error&) {
+                rows(dh * t / parts, dh * (t + 1) / parts);
+            }
+        }
+        rows(0, dh / parts);
+        for (std::thread& helper : helpers) helper.join();
+    }
+};
+
+static uint32_t* dibBits(HBITMAP bmp) {
+    DIBSECTION ds{};
+    return bmp && GetObjectW(bmp, sizeof ds, &ds) == sizeof ds ? (uint32_t*)ds.dsBm.bmBits : nullptr;
+}
+
+static bool zoomDraw(HWND h, float s) {
+    const int w = std::max(1, (int)lroundf(WIN_W * s)), hh = std::max(1, (int)lroundf(WIN_H * s));
+    if ((zoomGlide.frame.w < w || zoomGlide.frame.h < hh) &&
+        !zoomGlide.frame.make(std::max(w, zoomGlide.frame.w), std::max(hh, zoomGlide.frame.h))) return false;
+    const uint32_t* from = dibBits(zoomGlide.shot.bmp);
+    uint32_t* into = dibBits(zoomGlide.frame.bmp);
+    if (!from || !into) return false;
+    PictureScale{from, zoomGlide.shot.w, zoomGlide.shot.h, into, zoomGlide.frame.w, w, hh, {}, {}}.run();
+    RECT wr;
+    GetWindowRect(h, &wr);
+    BLENDFUNCTION bf = {AC_SRC_OVER, 0, windowAlphaByte(), 0};
+    POINT pos = {wr.left, wr.top}, src = {0, 0};
+    SIZE size = {w, hh};
+    if (!UpdateLayeredWindow(zoomGlide.ghost, nullptr, &pos, &size, zoomGlide.frame.dc, &src, 0, &bf, ULW_ALPHA)) return false;
+    zoomGlide.drawn = s;
+    return true;
+}
+
+static LRESULT CALLBACK zoomGhostProc(HWND g, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+    case WM_RBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+        if (HWND owner = GetWindow(g, GW_OWNER)) PostMessageW(owner, WM_ZOOM_SETTLE, 0, 0);
+        return 0;
+    }
+    return DefWindowProcW(g, m, w, l);
+}
+
+static void zoomUncover(HWND h) {
+    const bool shown = winFx.resizing;
+    winFx.resizing = false;
+    if (shown) applyWindowAlpha(h);
+    if (zoomGlide.ghost) {
+        ShowWindow(zoomGlide.ghost, SW_HIDE);
+        DestroyWindow(zoomGlide.ghost);
+    }
+    zoomGlide.ghost = nullptr;
+    zoomGlide.shot.drop();
+    zoomGlide.frame.drop();
+    if (shown) composeWait();
+}
+
+static bool zoomCover(HWND h) {
+    RECT wr;
+    GetWindowRect(h, &wr);
+    if (!zoomGlide.ghost) zoomGlide.ghost = makeGhost(h, L"OctopusZoom", zoomGhostProc, 0);
+    const bool shot = zoomGlide.ghost && zoomGlide.shot.make(wr.right - wr.left, wr.bottom - wr.top) &&
+                      PrintWindow(h, zoomGlide.shot.dc, PW_RENDERFULLCONTENT);
+    if (shot) GdiFlush();
+    if (!shot || !zoomDraw(h, uiScale)) {
+        zoomUncover(h);
+        return false;
+    }
+    HWND above = GetWindow(h, GW_HWNDPREV);
+    if (above == zoomGlide.ghost) above = GetWindow(above, GW_HWNDPREV);
+    SetWindowPos(zoomGlide.ghost, above ? above : HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    winFx.resizing = true;
+    SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
+    composeWait();
+    return true;
+}
+
+static void zoomClock(HWND h, bool run) {
+    if (run == zoomGlide.on) return;
+    zoomGlide.on = run;
+    if (run) SetTimer(h, ZOOM_TIMER, 8, nullptr);
+    else KillTimer(h, ZOOM_TIMER);
+}
+
+static void zoomStop(HWND h) {
+    if (!zoomGlide.on) return;
+    zoomClock(h, false);
+    zoomUncover(h);
+}
+
+static void zoomSettle(HWND h) {
+    if (!zoomGlide.on) return;
+    zoomClock(h, false);
+    if (zoomGlide.to != uiScale) applyScale(h, zoomGlide.to, nullptr, true);
+    if (!zoomDrag) zoomFinish(h);
+    RedrawWindow(h, nullptr, nullptr, RDW_UPDATENOW | RDW_ALLCHILDREN);
+    zoomUncover(h);
+}
+
+static void zoomPark(HWND h) {
+    if (!zoomGlide.on) return;
+    zoomStop(h);
+    zoomGlide.parked = true;
+}
+
+static void zoomUnpark(HWND h) {
+    if (!zoomGlide.parked) return;
+    zoomGlide.parked = false;
+    if (zoomGlide.to != uiScale) applyScale(h, zoomGlide.to, nullptr, true);
+    if (!zoomDrag) zoomFinish(h);
+}
+
+static void zoomAim(HWND h, float to) {
+    zoomGlide.to = to;
+    zoomGlide.aimed = fxNow();
+    zoomGlide.parked = false;
+    if (zoomGlide.on) return;
+    if (to == uiScale) {
+        if (!zoomDrag) zoomFinish(h);
+        return;
+    }
+    bool covered = false;
+    if (!zoomGlide.stuck && winFx.kind == FX_NONE && !winFx.faded && !IsIconic(h) && IsWindowVisible(h)) {
+        covered = zoomCover(h);
+        zoomGlide.stuck = !covered;
+    }
+    if (!covered) {
+        applyScale(h, to, nullptr, true);
+        if (!zoomDrag) zoomFinish(h);
+        return;
+    }
+    zoomGlide.at = uiScale;
+    zoomGlide.speed = 0.0;
+    zoomGlide.last = fxNow();
+    zoomClock(h, true);
+}
+
+static void zoomStep(HWND h) {
+    if (!zoomGlide.on) return;
+    const double now = fxNow();
+    const double dt = std::min((now - zoomGlide.last) / 1000.0, 0.05);
+    zoomGlide.last = now;
+    if (IsIconic(h)) return;
+    for (double left = dt; left > 1e-9; left -= 0.004) {
+        const double d = std::min(left, 0.004);
+        zoomGlide.speed += (ZOOM_SPRING * ZOOM_SPRING * (zoomGlide.to - zoomGlide.at) - 2.0 * ZOOM_SPRING * zoomGlide.speed) * d;
+        zoomGlide.at += zoomGlide.speed * d;
+    }
+    const bool settled = std::fabs(zoomGlide.to - zoomGlide.at) * WIN_W < 0.3 && std::fabs(zoomGlide.speed) * WIN_W < 15.0;
+    const float s = settled ? zoomGlide.to : (float)zoomGlide.at;
+    if (s != zoomGlide.drawn) {
+        if (!zoomDraw(h, s)) {
+            zoomGlide.stuck = true;
+            zoomSettle(h);
+            return;
+        }
+        composeWait();
+    }
+    if (settled && (!zoomDrag || now - zoomGlide.aimed >= ZOOM_REST_MS)) zoomSettle(h);
+}
+
+static void zoomDone(HWND h) {
+    zoomDrag = false;
+    settingsSave();
+    if (uiAnim) zoomAim(h, zoomFit(h, (float)uiZoom));
+    else zoomFinish(h);
+    zoomGlide.stuck = false;
 }
 static void dropDrags(HWND h) {
     const bool save = dragPitch || dragSize || dragVoice || dragVoiceSpeed || dragClipSpeed || dragApp;
@@ -10976,7 +12179,14 @@ static void zoomDragTo(HWND h) {
     GetCursorPos(&c);
     const double dx = c.x - zoomOrigin.x + 8, dy = c.y - zoomOrigin.y + 8;
     const double s = (dx * WIN_W + dy * WIN_H) / ((double)WIN_W * WIN_W + (double)WIN_H * WIN_H);
-    setZoom(h, (int)lround(s / (uiDpi / 96.0) * 100.0), true);
+    const double pct = s / (uiDpi / 96.0) * 100.0;
+    if (!uiAnim) {
+        setZoom(h, (int)lround(pct), true);
+        return;
+    }
+    const float want = zoomFit(h, (float)pct);
+    uiZoom = clampInt((int)lroundf(want / (uiDpi / 96.0f) * 100.0f), ZOOM_MIN, ZOOM_MAX);
+    zoomAim(h, want);
 }
 
 static std::vector<const RECT*> hoverables() {
@@ -10992,7 +12202,7 @@ static std::vector<const RECT*> hoverables() {
     } else {
         v.insert(v.end(), {&R_BOARD, &R_TONE, &R_SETUP_PREV, &R_SETUP_NEXT, &R_SAVE, &R_SETUP_DEL, &R_DEV_REFRESH, &R_ISO_PREV, &R_ISO_NEXT,
                            &R_EQ_SAVE, &R_EQ_DROP, &R_EQ_DEF, &R_CLIP_FILE, &R_CLIP_PLAY, &R_CLIP_STOP,
-                           &R_CLIP_BACK, &R_CLIP_FWD, &R_MASK_OFF, &R_GLITCH, &R_GLITCH_KEY});
+                           &R_CLIP_BACK, &R_CLIP_FWD, &R_MASK_OFF, &R_GLITCH, &R_GLITCH_KEY, &R_SB_UP, &R_SB_DOWN, &R_SB_TRACK});
         v.insert(v.end(), {&R_REC_FROM_VOICE, &R_REC_FROM_HEAR, &R_REC_LAST_PREV, &R_REC_LAST, &R_REC_LAST_NEXT, &R_REC_LAST_QUIET, &R_REC_FX, &R_REC_QUIET, &R_REC_REDO, &R_REC_GO, &R_REC_LISTEN, &R_REC_UNDO, &R_REC_DROP, &R_REC_FIN_PREV, &R_REC_FIN, &R_REC_FIN_NEXT, &R_REC_CUT, &R_REC_KEEP, &R_REC_SEND,
                            &R_REC_SAVE, &R_REC_FOUT_PREV, &R_REC_FOUT, &R_REC_FOUT_NEXT});
     }
@@ -11002,7 +12212,7 @@ static std::vector<const RECT*> hoverables() {
 static bool mouseTracked = false;
 
 static void saveSetupAs(HWND h) {
-    SetRectEmpty(&hotRect);
+    hotLeave(h);
     std::wstring name = askSetupName(h, curSetup);
     if (!name.empty()) {
         CreateDirectoryW(setupsDir().c_str(), nullptr);
@@ -11096,6 +12306,613 @@ static void hotkeyAction(HWND h, int act) {
     InvalidateRect(h, nullptr, FALSE);
 }
 
+static const UINT FADE_TIMER = 43;
+static const double FADE_MS = 170.0, FADE_GRACE_MS = 100.0;
+
+struct CrossFade {
+    HWND wnd = nullptr;
+    DockImage before;
+    RECT area{};
+    double start = 0.0, until = 0.0;
+    bool collecting = false;
+};
+static std::vector<CrossFade> crossFades;
+static int fadeDepth = 0;
+static double fadeScopeUntil = 0.0;
+
+struct FrameSurface {
+    HDC dc = nullptr;
+    const uint32_t* bits = nullptr;
+    int w = 0, h = 0;
+};
+
+static FrameSurface frameOf(HWND h) {
+    if (h == hwndMain) return {mainBufDc, dibBits(mainBufBmp), mainBufW, mainBufH};
+    for (BoxFrame& b : boxFrames)
+        if (b.wnd == h) return {b.img.dc, dibBits(b.img.bmp), b.img.w, b.img.h};
+    return {};
+}
+
+static CrossFade* fadeOf(HWND h) {
+    for (CrossFade& f : crossFades)
+        if (f.wnd == h) return &f;
+    return nullptr;
+}
+
+static void fadeDrop(HWND h) {
+    for (size_t i = 0; i < crossFades.size(); ++i) {
+        if (crossFades[i].wnd != h) continue;
+        const RECT area = crossFades[i].area;
+        crossFades[i].before.drop();
+        crossFades.erase(crossFades.begin() + (std::ptrdiff_t)i);
+        if (IsWindow(h)) {
+            KillTimer(h, FADE_TIMER);
+            if (!IsRectEmpty(&area)) InvalidateRect(h, &area, FALSE);
+        }
+        return;
+    }
+}
+
+static bool fadeTrigger(HWND h, UINT m, WPARAM w, LPARAM l) {
+    const HWND held = GetCapture();
+    if (held && (held == h || held == GetAncestor(h, GA_ROOT)) && m != WM_LBUTTONUP && m != WM_RBUTTONUP) return false;
+    if (m == WM_KEYDOWN && (l & 0x40000000)) return false;
+    if (m == WM_COMMAND && l && HIWORD(w) >= 0x100) return false;
+    if (m == WM_COMMAND && l && boxOfList(dropListOf((HWND)l)) == (HWND)l &&
+        (HIWORD(w) == CBN_DROPDOWN || HIWORD(w) == CBN_CLOSEUP || HIWORD(w) == CBN_SETFOCUS || HIWORD(w) == CBN_KILLFOCUS)) return false;
+    switch (m) {
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_LBUTTONDBLCLK:
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONUP:
+    case WM_MBUTTONDOWN:
+    case WM_KEYDOWN:
+    case WM_COMMAND:
+    case WM_HOTKEY:
+        return true;
+    }
+    return h == hwndMain && (m == WM_DEVICES_FOUND || m == WM_TAKE_SAVED || m == WM_LAST_SAVED || m == WM_SETUPS_FOUND ||
+                             m == WM_CABLE_READY || m == WM_BOARD_READY);
+}
+
+static bool fadeAllowed(HWND h) {
+    if (!uiAnim || !h || !IsWindow(h) || !IsWindowVisible(h) || IsIconic(h)) return false;
+    return h != hwndMain || (winFx.kind == FX_NONE && !winFx.faded && !winFx.resizing && !zoomGlide.on && !zoomDrag);
+}
+
+struct FadeSkip {
+    RECT r[2] = {};
+};
+
+static FadeSkip fadeSkip(HWND h) {
+    FadeSkip s;
+    if (h == hwndMain && licensed && !cablePanel) {
+        s.r[0] = scRect(stripRect());
+        s.r[1] = scRect(R_SB_ALL);
+    } else if (h == hBoard && boardScrolls()) {
+        s.r[0] = scRect(boardTrack());
+        if (boardGliding) s.r[1] = scRect(RB_LIST);
+    }
+    return s;
+}
+
+static RECT pixelChanges(const uint32_t* was, const uint32_t* now, int stride, const RECT& r, const FadeSkip& skip) {
+    LONG left = LONG_MAX, top = LONG_MAX, right = LONG_MIN, bottom = LONG_MIN;
+    for (LONG y = r.top; y < r.bottom; ++y) {
+        const uint32_t* a = was + (size_t)y * stride;
+        const uint32_t* b = now + (size_t)y * stride;
+        const RECT* cut[2];
+        int cuts = 0;
+        for (const RECT& k : skip.r)
+            if (y >= k.top && y < k.bottom && k.left < k.right) cut[cuts++] = &k;
+        for (LONG x = r.left; x < r.right; ++x) {
+            if (((a[x] ^ b[x]) & 0x00FFFFFFu) == 0) continue;
+            bool inside = false;
+            for (int i = 0; i < cuts && !inside; ++i) inside = x >= cut[i]->left && x < cut[i]->right;
+            if (inside) continue;
+            left = std::min(left, x);
+            right = std::max(right, x);
+            top = std::min(top, y);
+            bottom = std::max(bottom, y);
+        }
+    }
+    if (left == LONG_MAX) return RECT{0, 0, 0, 0};
+    return RECT{left, top, right + 1, bottom + 1};
+}
+
+static void blendOver(HDC dc, HDC old, const RECT& r, BYTE alpha) {
+    if (IsRectEmpty(&r)) return;
+    const BLENDFUNCTION bf = {AC_SRC_OVER, 0, alpha, 0};
+    const int w = (int)(r.right - r.left), hh = (int)(r.bottom - r.top);
+    AlphaBlend(dc, r.left, r.top, w, hh, old, r.left, r.top, w, hh, bf);
+}
+
+static void blendAround(HDC dc, HDC old, const RECT& r, const FadeSkip& skip, BYTE alpha) {
+    const int saved = SaveDC(dc);
+    for (const RECT& k : skip.r)
+        if (!IsRectEmpty(&k)) ExcludeClipRect(dc, k.left, k.top, k.right, k.bottom);
+    blendOver(dc, old, r, alpha);
+    RestoreDC(dc, saved);
+}
+
+static void fadeApply(HWND h, HDC dc, const RECT& paint) {
+    CrossFade* f = fadeOf(h);
+    if (!f || !f->before.dc) return;
+    const FrameSurface s = frameOf(h);
+    if (s.dc != dc || !s.bits || s.w != f->before.w || s.h != f->before.h) {
+        fadeDrop(h);
+        return;
+    }
+    const FadeSkip skip = fadeSkip(h);
+    if (f->collecting) {
+        if (fxNow() > f->until) {
+            fadeDrop(h);
+            return;
+        }
+        const uint32_t* was = dibBits(f->before.bmp);
+        RECT r;
+        const RECT whole = {0, 0, s.w, s.h};
+        if (was && IntersectRect(&r, &paint, &whole)) {
+            GdiFlush();
+            const RECT changed = pixelChanges(was, s.bits, s.w, r, skip);
+            if (!IsRectEmpty(&changed)) UnionRect(&f->area, &f->area, &changed);
+        }
+    }
+    if (IsRectEmpty(&f->area)) return;
+    const double k = f->start > 0.0 ? (fxNow() - f->start) / FADE_MS : 0.0;
+    if (k >= 1.0) return;
+    const BYTE alpha = (BYTE)std::lround(255.0 * (1.0 - easeInOut(k)));
+    RECT r;
+    if (alpha && IntersectRect(&r, &f->area, &paint)) blendAround(dc, f->before.dc, r, skip, alpha);
+}
+
+static void CALLBACK fadeTick(HWND h, UINT, UINT_PTR id, DWORD) {
+    CrossFade* f = fadeOf(h);
+    if (!f) {
+        KillTimer(h, id);
+        return;
+    }
+    if (f->collecting) {
+        if (fxNow() > f->until) fadeDrop(h);
+        return;
+    }
+    if (fxNow() - f->start >= FADE_MS) {
+        fadeDrop(h);
+        return;
+    }
+    InvalidateRect(h, &f->area, FALSE);
+}
+
+static bool fadeArm(HWND h, double until) {
+    if (!fadeAllowed(h)) return false;
+    const CrossFade* armed = fadeOf(h);
+    if (armed && armed->collecting && armed->until == until) return true;
+    UpdateWindow(h);
+    FrameSurface s = frameOf(h);
+    if (!s.dc && h != hwndMain) {
+        RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+        s = frameOf(h);
+    }
+    if (!s.dc || !s.bits || s.w <= 0 || s.h <= 0) return false;
+    CrossFade* f = fadeOf(h);
+    if (!f) {
+        crossFades.push_back(CrossFade{});
+        f = &crossFades.back();
+        f->wnd = h;
+    }
+    if (!f->before.make(s.w, s.h)) {
+        fadeDrop(h);
+        return false;
+    }
+    BitBlt(f->before.dc, 0, 0, s.w, s.h, s.dc, 0, 0, SRCCOPY);
+    GdiFlush();
+    f->collecting = true;
+    f->until = until;
+    f->start = 0.0;
+    return true;
+}
+
+static bool fadeArmCached(HWND h, double until) {
+    const FrameSurface s = frameOf(h);
+    if (!s.dc || !s.bits || s.w <= 0 || s.h <= 0) return false;
+    CrossFade* f = fadeOf(h);
+    if (!f) {
+        crossFades.push_back(CrossFade{});
+        f = &crossFades.back();
+        f->wnd = h;
+    }
+    if (!f->before.make(s.w, s.h)) {
+        fadeDrop(h);
+        return false;
+    }
+    BitBlt(f->before.dc, 0, 0, s.w, s.h, s.dc, 0, 0, SRCCOPY);
+    GdiFlush();
+    f->collecting = true;
+    f->until = until;
+    f->start = 0.0;
+    return true;
+}
+
+static void fadeStart(HWND h) {
+    CrossFade* f = fadeOf(h);
+    if (!f) return;
+    if (fxNow() > f->until || !fadeAllowed(h) || GetCapture() == h) {
+        fadeDrop(h);
+        return;
+    }
+    UpdateWindow(h);
+    f = fadeOf(h);
+    if (!f) return;
+    f->collecting = false;
+    if (IsRectEmpty(&f->area)) {
+        fadeDrop(h);
+        return;
+    }
+    f->start = fxNow();
+    SetTimer(h, FADE_TIMER, 15, fadeTick);
+}
+
+static bool hoverWatch(HWND h, UINT m, WPARAM w) {
+    if (m != WM_MOUSEMOVE && m != WM_MOUSELEAVE) return false;
+    if (h == hwndMain || !uiAnim || (fadeDepth > 0 && fxNow() <= fadeScopeUntil)) return false;
+    if (m == WM_MOUSEMOVE && (w & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON))) return false;
+    const HWND held = GetCapture();
+    if (held && (held == h || held == GetAncestor(h, GA_ROOT))) return false;
+    const CrossFade* f = fadeOf(h);
+    if (f && f->collecting) return false;
+    if (!fadeAllowed(h) || GetUpdateRect(h, nullptr, FALSE)) return false;
+    if (!frameOf(h).dc) RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+    return frameOf(h).dc != nullptr;
+}
+
+static void hoverFade(HWND h) {
+    if (!GetUpdateRect(h, nullptr, FALSE) || !fadeAllowed(h)) return;
+    const HWND held = GetCapture();
+    if (held && (held == h || held == GetAncestor(h, GA_ROOT))) return;
+    if (fadeArmCached(h, fxNow() + FADE_GRACE_MS)) fadeStart(h);
+}
+
+static void fadeForget(HWND h) {
+    fadeDrop(h);
+    for (size_t i = 0; i < boxFrames.size(); ++i)
+        if (boxFrames[i].wnd == h) {
+            boxFrames[i].img.drop();
+            boxFrames.erase(boxFrames.begin() + (std::ptrdiff_t)i);
+            return;
+        }
+}
+
+static double fadeBegin(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (!uiAnim || !fadeTrigger(h, m, w, l)) return -1.0;
+    for (size_t i = 0; i < crossFades.size();) {
+        if (IsWindow(crossFades[i].wnd)) {
+            ++i;
+            continue;
+        }
+        crossFades[i].before.drop();
+        crossFades.erase(crossFades.begin() + (std::ptrdiff_t)i);
+    }
+    const double now = fxNow();
+    if (fadeDepth > 0 && now <= fadeScopeUntil) return -1.0;
+    const double outer = fadeScopeUntil;
+    ++fadeDepth;
+    fadeScopeUntil = now + FADE_GRACE_MS;
+    fadeArm(hwndMain, fadeScopeUntil);
+    fadeArm(h, fadeScopeUntil);
+    for (size_t i = 0; i < boxFrames.size(); ++i) fadeArm(boxFrames[i].wnd, fadeScopeUntil);
+    return outer;
+}
+
+static void fadeEnd(double outer) {
+    if (outer < 0.0) return;
+    std::vector<HWND> due;
+    for (const CrossFade& f : crossFades)
+        if (f.collecting) due.push_back(f.wnd);
+    for (HWND h : due) fadeStart(h);
+    fadeScopeUntil = outer;
+    --fadeDepth;
+}
+
+struct GhostFade {
+    HWND ghost = nullptr;
+    DockImage img;
+    RECT at{};
+    double start = 0.0, ms = 0.0;
+    BYTE peak = 255;
+};
+static std::vector<GhostFade> ghostFades;
+static UINT_PTR ghostTimer = 0;
+
+static void CALLBACK ghostTick(HWND, UINT, UINT_PTR, DWORD) {
+    const double now = fxNow();
+    for (size_t i = 0; i < ghostFades.size();) {
+        const GhostFade g = ghostFades[i];
+        const double k = (now - g.start) / g.ms;
+        if (k >= 1.0 || !IsWindow(g.ghost)) {
+            ghostFades.erase(ghostFades.begin() + (std::ptrdiff_t)i);
+            if (IsWindow(g.ghost)) DestroyWindow(g.ghost);
+            DockImage img = g.img;
+            img.drop();
+            continue;
+        }
+        BLENDFUNCTION bf = {AC_SRC_OVER, 0, (BYTE)std::lround(g.peak * (1.0 - easeInOut(k))), 0};
+        UpdateLayeredWindow(g.ghost, nullptr, nullptr, nullptr, nullptr, nullptr, 0, &bf, ULW_ALPHA);
+        ++i;
+    }
+    if (ghostFades.empty() && ghostTimer) {
+        KillTimer(nullptr, ghostTimer);
+        ghostTimer = 0;
+    }
+}
+
+static void ghostRun(HWND owner, const RECT& at, DockImage& img, double ms, int peak) {
+    if (!uiAnim || !img.dc) {
+        img.drop();
+        return;
+    }
+    const HWND ghost = makeGhost(owner, L"OctopusDock", DefWindowProcW, WS_EX_TRANSPARENT | (owner ? 0 : WS_EX_TOPMOST));
+    if (!ghost) {
+        img.drop();
+        return;
+    }
+    if (peak < 0) peak = owner == hwndMain ? windowAlphaByte() : 255;
+    BLENDFUNCTION bf = {AC_SRC_OVER, 0, (BYTE)peak, 0};
+    POINT pos = {at.left, at.top}, src = {0, 0};
+    SIZE size = {img.w, img.h};
+    UpdateLayeredWindow(ghost, nullptr, &pos, &size, img.dc, &src, 0, &bf, ULW_ALPHA);
+    HWND above = owner ? GetWindow(owner, GW_HWNDPREV) : HWND_TOPMOST;
+    if (above == ghost) above = GetWindow(ghost, GW_HWNDPREV);
+    SetWindowPos(ghost, above ? above : HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    GhostFade g;
+    g.ghost = ghost;
+    g.img = img;
+    img = DockImage{};
+    g.at = at;
+    g.start = fxNow();
+    g.ms = ms;
+    g.peak = (BYTE)peak;
+    ghostFades.push_back(g);
+    if (!ghostTimer) ghostTimer = SetTimer(nullptr, 0, 15, ghostTick);
+}
+
+static bool snapPrint(HWND w, DockImage& img) {
+    RECT r;
+    if (!w || !IsWindowVisible(w) || !GetWindowRect(w, &r)) return false;
+    if (!img.make((int)(r.right - r.left), (int)(r.bottom - r.top))) return false;
+    const bool ok = PrintWindow(w, img.dc, PW_RENDERFULLCONTENT) != FALSE;
+    GdiFlush();
+    return ok;
+}
+
+static bool snapFaceAs(HWND box, DockImage& img, int open) {
+    RECT r;
+    if (!box || !IsWindowVisible(box) || !GetClientRect(box, &r) || !img.make((int)r.right, (int)r.bottom)) return false;
+    paintComboFace(box, img.dc, open);
+    GdiFlush();
+    return true;
+}
+
+static HWND boxOfList(HWND list) {
+    for (HWND b : {hMic, hSpk, hApp, hEqBox, hMaskBox, hOwnBox, hGlitchBox})
+        if (b && dropListOf(b) == list) return b;
+    return nullptr;
+}
+
+static bool snapList(HWND list, HWND item, DockImage& img) {
+    RECT wr, cr;
+    POINT o = {0, 0};
+    if (!list || !item || !IsWindowVisible(list) || !GetWindowRect(list, &wr) || !GetClientRect(list, &cr) || !ClientToScreen(list, &o)) return false;
+    const int w = (int)(wr.right - wr.left), h = (int)(wr.bottom - wr.top), ox = (int)(o.x - wr.left), oy = (int)(o.y - wr.top);
+    if ((int)cr.right < w - 2 * ox) return snapPrint(list, img);
+    const int count = (int)SendMessageW(list, LB_GETCOUNT, 0, 0), top = (int)SendMessageW(list, LB_GETTOPINDEX, 0, 0);
+    const int itemH = (int)SendMessageW(list, LB_GETITEMHEIGHT, 0, 0), sel = (int)SendMessageW(list, LB_GETCURSEL, 0, 0);
+    if (count == LB_ERR || top == LB_ERR || itemH <= 0 || !img.make(w, h)) return false;
+    HBRUSH bg = CreateSolidBrush(C_BACK);
+    const RECT whole = {0, 0, w, h};
+    FillRect(img.dc, &whole, bg);
+    DeleteObject(bg);
+    const int saved = SaveDC(img.dc);
+    IntersectClipRect(img.dc, ox, oy, ox + (int)cr.right, oy + (int)cr.bottom);
+    for (int i = top; i < count && (i - top) * itemH < (int)cr.bottom; ++i) {
+        DRAWITEMSTRUCT d{};
+        d.CtlType = item == list ? ODT_LISTBOX : ODT_COMBOBOX;
+        d.CtlID = (UINT)GetDlgCtrlID(item);
+        d.itemID = (UINT)i;
+        d.itemAction = ODA_DRAWENTIRE;
+        d.itemState = i == sel ? ODS_SELECTED : 0;
+        d.hwndItem = item;
+        d.hDC = img.dc;
+        d.rcItem = {ox, oy + (i - top) * itemH, ox + (int)cr.right, oy + (i - top + 1) * itemH};
+        drawItem(&d);
+    }
+    RestoreDC(img.dc, saved);
+    if (ox > 0 || oy > 0) {
+        HPEN pe = linePen(C_EDGE);
+        HGDIOBJ op = SelectObject(img.dc, pe), ob = SelectObject(img.dc, GetStockObject(NULL_BRUSH));
+        Rectangle(img.dc, 0, 0, w, h);
+        SelectObject(img.dc, op);
+        SelectObject(img.dc, ob);
+        DeleteObject(pe);
+    }
+    GdiFlush();
+    return true;
+}
+
+struct SlideGhost {
+    HWND ghost = nullptr, list = nullptr;
+    DockImage img;
+    POINT at{};
+    SIZE view{};
+    int from = 0, to = 0, top = 0;
+    double start = 0.0;
+    BYTE peak = 255;
+};
+static std::vector<SlideGhost> slideGhosts;
+static UINT_PTR slideTimer = 0;
+static const double SLIDE_MS = 120.0;
+
+static void slideEnd(size_t i) {
+    const SlideGhost done = slideGhosts[i];
+    slideGhosts.erase(slideGhosts.begin() + (std::ptrdiff_t)i);
+    if (IsWindow(done.ghost)) DestroyWindow(done.ghost);
+    DockImage img = done.img;
+    img.drop();
+}
+
+static void CALLBACK slideTick(HWND, UINT, UINT_PTR, DWORD) {
+    const double now = fxNow();
+    for (size_t i = 0; i < slideGhosts.size();) {
+        SlideGhost& s = slideGhosts[i];
+        const double k = (now - s.start) / SLIDE_MS;
+        if (k >= 1.0 || !IsWindow(s.ghost)) {
+            slideEnd(i);
+            continue;
+        }
+        const double e = 1.0 - (1.0 - k) * (1.0 - k) * (1.0 - k);
+        POINT src = {0, (LONG)std::lround(s.from + (s.to - s.from) * e)};
+        BLENDFUNCTION bf = {AC_SRC_OVER, 0, s.peak, 0};
+        UpdateLayeredWindow(s.ghost, nullptr, &s.at, &s.view, s.img.dc, &src, 0, &bf, ULW_ALPHA);
+        ++i;
+    }
+    if (slideGhosts.empty() && slideTimer) {
+        KillTimer(nullptr, slideTimer);
+        slideTimer = 0;
+    }
+}
+
+static void ghostDropAt(const RECT& r) {
+    for (size_t i = 0; i < ghostFades.size();) {
+        if (!EqualRect(&ghostFades[i].at, &r)) {
+            ++i;
+            continue;
+        }
+        const GhostFade g = ghostFades[i];
+        ghostFades.erase(ghostFades.begin() + (std::ptrdiff_t)i);
+        if (IsWindow(g.ghost)) DestroyWindow(g.ghost);
+        DockImage img = g.img;
+        img.drop();
+    }
+}
+
+static int slideAt(const SlideGhost& s) {
+    const double k = std::min(1.0, (fxNow() - s.start) / SLIDE_MS), e = 1.0 - (1.0 - k) * (1.0 - k) * (1.0 - k);
+    return (int)std::lround(s.from + (s.to - s.from) * e);
+}
+
+static bool slideOn(SlideGhost& s, DockImage& after, int ox, int oy, int shift, bool down, int toTop) {
+    DockImage grown;
+    if (!grown.make(s.view.cx, s.img.h + shift)) return false;
+    const int cur = slideAt(s), cw = (int)s.view.cx, ch = (int)s.view.cy;
+    if (down) {
+        BitBlt(grown.dc, 0, 0, cw, s.img.h, s.img.dc, 0, 0, SRCCOPY);
+        BitBlt(grown.dc, 0, s.img.h, cw, shift, after.dc, ox, oy + ch - shift, SRCCOPY);
+        s.from = cur;
+        s.to += shift;
+    } else {
+        BitBlt(grown.dc, 0, 0, cw, shift, after.dc, ox, oy, SRCCOPY);
+        BitBlt(grown.dc, 0, shift, cw, s.img.h, s.img.dc, 0, 0, SRCCOPY);
+        s.from = cur + shift;
+        s.to = 0;
+    }
+    GdiFlush();
+    s.img.drop();
+    s.img = grown;
+    s.top = toTop;
+    s.start = fxNow();
+    return true;
+}
+
+static void listScrolled(HWND owner, HWND list, DockImage& before, int fromTop, int toTop) {
+    DockImage after;
+    RECT wr, cr;
+    POINT o = {0, 0};
+    const int itemH = (int)SendMessageW(list, LB_GETITEMHEIGHT, 0, 0);
+    if (!uiAnim || !before.dc || itemH <= 0 || !GetWindowRect(list, &wr) || !GetClientRect(list, &cr) || !ClientToScreen(list, &o) ||
+        !snapList(list, list, after) || after.w != before.w || after.h != before.h) {
+        after.drop();
+        before.drop();
+        return;
+    }
+    const int ox = (int)(o.x - wr.left), oy = (int)(o.y - wr.top), cw = (int)cr.right, ch = (int)cr.bottom;
+    const int shift = std::abs(toTop - fromTop) * itemH;
+    ghostDropAt(wr);
+    for (size_t i = 0; i < slideGhosts.size(); ++i) {
+        SlideGhost& run = slideGhosts[i];
+        if (run.list != list) continue;
+        const bool same = run.top == fromTop && run.view.cx == cw && run.view.cy == ch && shift > 0 && shift < ch &&
+                          (toTop > fromTop) == (run.to > run.from) && run.img.h + shift <= 4 * ch;
+        if (same && slideOn(run, after, ox, oy, shift, toTop > fromTop, toTop)) {
+            after.drop();
+            before.drop();
+            return;
+        }
+        slideEnd(i);
+        break;
+    }
+    if (shift <= 0 || shift >= ch || cw <= 0) {
+        after.drop();
+        ghostRun(owner, wr, before, 150.0);
+        return;
+    }
+    SlideGhost s;
+    if (!s.img.make(cw, ch + shift)) {
+        after.drop();
+        before.drop();
+        return;
+    }
+    if (toTop > fromTop) {
+        BitBlt(s.img.dc, 0, 0, cw, ch, before.dc, ox, oy, SRCCOPY);
+        BitBlt(s.img.dc, 0, ch, cw, shift, after.dc, ox, oy + ch - shift, SRCCOPY);
+        s.from = 0;
+        s.to = shift;
+    } else {
+        BitBlt(s.img.dc, 0, 0, cw, shift, after.dc, ox, oy, SRCCOPY);
+        BitBlt(s.img.dc, 0, shift, cw, ch, before.dc, ox, oy, SRCCOPY);
+        s.from = shift;
+        s.to = 0;
+    }
+    GdiFlush();
+    after.drop();
+    before.drop();
+    s.ghost = makeGhost(owner, L"OctopusDock", DefWindowProcW, WS_EX_TRANSPARENT);
+    if (!s.ghost) {
+        s.img.drop();
+        return;
+    }
+    s.list = list;
+    s.top = toTop;
+    s.at = o;
+    s.view = {cw, ch};
+    s.peak = owner == hwndMain ? windowAlphaByte() : 255;
+    POINT src = {0, s.from};
+    BLENDFUNCTION bf = {AC_SRC_OVER, 0, s.peak, 0};
+    UpdateLayeredWindow(s.ghost, nullptr, &s.at, &s.view, s.img.dc, &src, 0, &bf, ULW_ALPHA);
+    HWND above = GetWindow(owner, GW_HWNDPREV);
+    if (above == s.ghost) above = GetWindow(s.ghost, GW_HWNDPREV);
+    SetWindowPos(s.ghost, above ? above : HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    s.start = fxNow();
+    slideGhosts.push_back(s);
+    if (!slideTimer) slideTimer = SetTimer(nullptr, 0, 10, slideTick);
+}
+
+static void ghostClear() {
+    for (GhostFade& g : ghostFades) {
+        if (IsWindow(g.ghost)) DestroyWindow(g.ghost);
+        g.img.drop();
+    }
+    ghostFades.clear();
+    if (ghostTimer) KillTimer(nullptr, ghostTimer);
+    ghostTimer = 0;
+    while (!slideGhosts.empty()) slideEnd(slideGhosts.size() - 1);
+    if (slideTimer) KillTimer(nullptr, slideTimer);
+    slideTimer = 0;
+    while (!rollGhosts.empty()) rollEnd(rollGhosts.size() - 1);
+    if (rollTimer) KillTimer(nullptr, rollTimer);
+    rollTimer = 0;
+    dropStop();
+}
+
 static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_PAINT:
@@ -11146,6 +12963,13 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_DEVICES_FOUND:
         devicesFound(h, l);
         return 0;
+    case WM_FIT_DROP:
+        dropShown((HWND)l);
+        fitDropList((HWND)l);
+        return 0;
+    case WM_FACE_FADE:
+        faceFade(h, (HWND)l);
+        return 0;
     case WM_ACTIVATE:
         if (LOWORD(w) == WA_INACTIVE && glitchListening) {
             glitchListening = false;
@@ -11153,6 +12977,8 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         break;
     case WM_DPICHANGED: {
+        zoomStop(h);
+        zoomGlide.parked = false;
         uiDpi = HIWORD(w);
         const RECT* at = (const RECT*)l;
         const float s = fitScale(zoomScale(), workAreaOf(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST)));
@@ -11163,6 +12989,9 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_TAKE_SAVED:
         takeSaved(h, l);
+        return 0;
+    case WM_ZOOM_SETTLE:
+        zoomSettle(h);
         return 0;
     case WM_LAST_SAVED:
         lastSaved(h, l);
@@ -11198,6 +13027,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_LBUTTONDOWN: {
         POINT p = {(short)LOWORD(l), (short)HIWORD(l)};
+        if (PtInRect(&hotRect, p)) hotPressAt(hotRect);
         if (PtInRect(&R_GRIP, p)) {
             RECT wr;
             GetWindowRect(h, &wr);
@@ -11209,10 +13039,10 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         if (PtInRect(&R_CLOSE, p)) { PostMessageW(h, WM_CLOSE, 0, 0); return 0; }
         if (PtInRect(&R_MIN, p)) { SendMessageW(h, WM_SYSCOMMAND, SC_MINIMIZE, 0); return 0; }
-        if (PtInRect(&R_GEAR, p)) { SetRectEmpty(&hotRect); pickLook(h); return 0; }
-        if (PtInRect(&rCredit, p)) { SetRectEmpty(&hotRect); showAbout(h); return 0; }
+        if (PtInRect(&R_GEAR, p)) { hotLeave(h); pickLook(h); return 0; }
+        if (PtInRect(&rCredit, p)) { hotLeave(h); showAbout(h); return 0; }
         if (licensed && PtInRect(&rSignOut, p)) {
-            SetRectEmpty(&hotRect);
+            hotLeave(h);
             if (confirmSignOut(h)) signOutNow(h);
             InvalidateRect(h, nullptr, FALSE);
             return 0;
@@ -11224,7 +13054,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     cablePanel = false;
                     applyLicenceLayout();
                 } else if (view == VIEW_RESTART) {
-                    SetRectEmpty(&hotRect);
+                    hotLeave(h);
                     restartPc(h);
                 } else {
                     startCableDownload(h);
@@ -11481,7 +13311,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
 
         if (PtInRect(&R_TONE, p)) {
-            SetRectEmpty(&hotRect);
+            hotLeave(h);
             openToneBox(h);
             InvalidateRect(h, nullptr, FALSE);
             return 0;
@@ -11496,7 +13326,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
         }
         if (PtInRect(&R_BOARD, p)) {
-            SetRectEmpty(&hotRect);
+            hotLeave(h);
             openBoard(h);
             InvalidateRect(h, nullptr, FALSE);
             return 0;
@@ -11526,7 +13356,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         if (PtInRect(&R_EQ_SAVE, p)) {
             const int cur = g.eqPreset.load();
-            SetRectEmpty(&hotRect);
+            hotLeave(h);
             std::wstring name = askSetupName(h, cur >= eqb::NUM_EQ_PRESETS ? eqPresetName(cur) : L"");
             if (!name.empty()) {
                 EqUserPreset np; np.name = name;
@@ -11582,9 +13412,9 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 int vis   = PRESET_H / ITEM_H;
                 int ry    = p.y - PRESET_Y;
                 if (ry < AH) {
-                    if (top > 0) { SendMessageW(hPreset, LB_SETTOPINDEX, top - 1, 0); }
+                    if (top > 0) presetTopTo(h, top - 1);
                 } else if (ry >= PRESET_H - AH) {
-                    if (top + vis < total) { SendMessageW(hPreset, LB_SETTOPINDEX, top + 1, 0); }
+                    if (top + vis < total) presetTopTo(h, top + 1);
                 } else {
                     int trackH = PRESET_H - 2*AH;
                     int thumbH = (total > vis) ? max(AH, trackH * vis / total) : trackH;
@@ -11595,9 +13425,9 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                         sbDragOff = relY - thumbY;
                         SetCapture(h);
                     } else if (relY < thumbY) {
-                        SendMessageW(hPreset, LB_SETTOPINDEX, max(0, top - vis), 0);
+                        presetTopTo(h, max(0, top - vis));
                     } else {
-                        SendMessageW(hPreset, LB_SETTOPINDEX, min(total - vis, top + vis), 0);
+                        presetTopTo(h, min(total - vis, top + vis));
                     }
                 }
                 InvalidateRect(h, nullptr, FALSE);
@@ -11614,7 +13444,12 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_LBUTTONDBLCLK: {
         const POINT p = {(short)LOWORD(l), (short)HIWORD(l)};
         if (PtInRect(&R_GRIP, p)) {
-            setZoom(h, 100, false);
+            if (uiAnim) {
+                uiZoom = 100;
+                zoomAim(h, zoomFit(h, 100.0f));
+            } else {
+                setZoom(h, 100, false);
+            }
             settingsSave();
             return 0;
         }
@@ -11663,7 +13498,13 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             int newTop  = (int)((long long)relY * maxTop / max(1, trackH - thumbH));
             if (newTop < 0) newTop = 0;
             if (newTop > maxTop) newTop = maxTop;
-            SendMessageW(hPreset, LB_SETTOPINDEX, newTop, 0);
+            if (newTop != (int)SendMessageW(hPreset, LB_GETTOPINDEX, 0, 0)) {
+                SendMessageW(hPreset, WM_SETREDRAW, FALSE, 0);
+                SendMessageW(hPreset, LB_SETTOPINDEX, newTop, 0);
+                SendMessageW(hPreset, WM_SETREDRAW, TRUE, 0);
+                InvalidateRect(hPreset, nullptr, FALSE);
+                roomHoverRefresh();
+            }
             InvalidateRect(h, nullptr, FALSE);
             return 0;
         }
@@ -11690,14 +13531,15 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_MOUSELEAVE:
         mouseTracked = false;
-        if (!IsRectEmpty(&hotRect)) { invalidateDesign(h, hotRect); SetRectEmpty(&hotRect); hotMoveTo(hotRect); }
+        hotLeave(h);
         if (waveHoverX >= 0 || take.w.hot != WH_NONE) {
             waveHoverX = -1;
             take.w.hot = WH_NONE;
             invalidateDesign(h, R_REC_WAVE);
         }
         return 0;
-    case WM_SETCURSOR:
+    case WM_SETCURSOR: {
+        RECT probe;
         if (LOWORD(l) == HTCLIENT && waveEdgeCursor(take.w)) {
             SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32644)));
             return TRUE;
@@ -11707,12 +13549,13 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return TRUE;
         }
         if (LOWORD(l) == HTCLIENT &&
-            (!IsRectEmpty(&hotRect) ||
+            ((!IsRectEmpty(&hotRect) && !IntersectRect(&probe, &hotRect, &R_SB_ALL)) ||
              (licensed && !cablePanel && g.needCable.load() && hotStatus))) {
             SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32649)));
             return TRUE;
         }
         break;
+    }
     case WM_RBUTTONDOWN:
         break;
     case WM_LBUTTONUP:
@@ -11763,38 +13606,34 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         RECT micArea = {R_MIC.left - 8, R_MIC.top - 14,
                         R_MIC.right + 8, R_MIC.bottom + 14};
         if (PtInRect(&micArea, pt)) {
-            const int level = g.micLevel.load() + d * 10;
-            g.micLevel = level < 0 ? 0 : (level > MIC_MAX ? MIC_MAX : level);
-            InvalidateRect(h, nullptr, FALSE);
+            wheelKnob(h, K_MIC, std::max(0, std::min(MIC_MAX, knobAim(K_MIC) + d * 10)));
             return 0;
         }
         {
             RECT pitchArea = {R_PITCH.left - 8, R_PITCH.top - 10, R_PITCH.right + 8, R_PITCH.bottom + 10};
             RECT sizeArea  = {R_SIZE.left - 8, R_SIZE.top - 10, R_SIZE.right + 8, R_SIZE.bottom + 10};
             if (PtInRect(&pitchArea, pt)) {
-                int v = g.pitchHz.load() + d * 5;
-                g.pitchHz = v < -PITCH_SPAN ? -PITCH_SPAN : (v > PITCH_SPAN ? PITCH_SPAN : v);
-                settingsSave(); InvalidateRect(h, nullptr, FALSE); return 0;
+                wheelKnob(h, K_PITCH, std::max(-PITCH_SPAN, std::min(PITCH_SPAN, knobAim(K_PITCH) + d * 5)));
+                return 0;
             }
             if (PtInRect(&sizeArea, pt)) {
-                int v = g.voiceSize.load() + d * 2;
-                g.voiceSize = v < VSIZE_MIN ? VSIZE_MIN : (v > VSIZE_MAX ? VSIZE_MAX : v);
-                settingsSave(); InvalidateRect(h, nullptr, FALSE); return 0;
+                wheelKnob(h, K_SIZE, std::max(VSIZE_MIN, std::min(VSIZE_MAX, knobAim(K_SIZE) + d * 2)));
+                return 0;
             }
             RECT voiceArea = {R_VOICE.left - 8, R_VOICE.top - 10, R_VOICE.right + 8, R_VOICE.bottom + 10};
             if (PtInRect(&voiceArea, pt)) {
-                applyVoiceMacro(g.voiceMacro.load() + d * 5);
-                settingsSave(); InvalidateRect(h, nullptr, FALSE); return 0;
+                wheelKnob(h, K_VOICE, std::max(-100, std::min(100, knobAim(K_VOICE) + d * 5)));
+                return 0;
             }
             RECT voiceSpeedArea = {R_VSPEED.left - 8, R_VSPEED.top - 10, R_VSPEED.right + 8, R_VSPEED.bottom + 10};
             if (PtInRect(&voiceSpeedArea, pt)) {
-                g.voiceSpeed = stepSpeed(g.voiceSpeed.load(), d);
-                settingsSave(); InvalidateRect(h, nullptr, FALSE); return 0;
+                wheelKnob(h, K_VSPEED, stepSpeed(knobAim(K_VSPEED), d));
+                return 0;
             }
             RECT clipSpeedArea = {R_CLIP_SPEED.left - 8, R_CLIP_SPEED.top - 10, R_CLIP_SPEED.right + 8, R_CLIP_SPEED.bottom + 10};
             if (PtInRect(&clipSpeedArea, pt)) {
-                g.clipSpeed = stepSpeed(g.clipSpeed.load(), d);
-                settingsSave(); InvalidateRect(h, nullptr, FALSE); return 0;
+                wheelKnob(h, K_CLIP_SPEED, stepSpeed(knobAim(K_CLIP_SPEED), d));
+                return 0;
             }
         }
         RECT presetArea = {PRESET_X, PRESET_Y, PRESET_SBX + PRESET_SBW, PRESET_Y + PRESET_H};
@@ -11805,18 +13644,14 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             int nt    = top - d;
             if (nt < 0) nt = 0;
             if (nt > max(0, total - vis)) nt = max(0, total - vis);
-            SendMessageW(hPreset, LB_SETTOPINDEX, nt, 0);
+            presetTopTo(h, nt);
             InvalidateRect(h, nullptr, FALSE);
             return 0;
         }
         {
             RECT isoArea = {R_ISOLVL.left - 8, R_ISOLVL.top - 10, R_ISOLVL.right + 8, R_ISOLVL.bottom + 10};
             if (PtInRect(&isoArea, pt)) {
-                const int v = isoFader().load() + d * 5;
-                isoFader() = v < 0 ? 0 : (v > 100 ? 100 : v);
-                g.isoVersion.fetch_add(1);
-                settingsSave();
-                InvalidateRect(h, nullptr, FALSE);
+                wheelKnob(h, K_ISO, std::max(0, std::min(100, knobAim(K_ISO) + d * 5)));
                 return 0;
             }
         }
@@ -11824,28 +13659,23 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             const int x = eqFaderX(k);
             RECT fr = {x - 14, EQ_FT - 10, x + 15, EQ_FB + 26};
             if (!PtInRect(&fr, pt)) continue;
-            if (k < eqb::EQ_BANDS) {
-                int v = g.eqDb[k].load() + d;
-                g.eqDb[k] = v < -eqb::EQ_RANGE ? -eqb::EQ_RANGE : (v > eqb::EQ_RANGE ? eqb::EQ_RANGE : v);
-            } else {
-                int v = g.eqLevel.load() - d;
-                g.eqLevel = v < 0 ? 0 : (v > eqb::EQ_LEVEL_RANGE ? eqb::EQ_LEVEL_RANGE : v);
-            }
-            eqBump();
-            InvalidateRect(h, nullptr, FALSE);
+            if (k < eqb::EQ_BANDS) wheelKnob(h, K_EQ + k, std::max(-eqb::EQ_RANGE, std::min(eqb::EQ_RANGE, knobAim(K_EQ + k) + d)));
+            else wheelKnob(h, K_EQ_LEVEL, std::max(0, std::min(eqb::EQ_LEVEL_RANGE, knobAim(K_EQ_LEVEL) - d)));
             return 0;
         }
         RECT roomArea = {12, TITLE_H + 146, COL_W - 12, TITLE_H + 444};
-        if (PtInRect(&roomArea, pt)) {
-            int a = g.amount.load() + d;
-            g.amount = a < 0 ? 0 : (a > 100 ? 100 : a);
-            InvalidateRect(h, nullptr, FALSE);
-        }
+        if (PtInRect(&roomArea, pt)) wheelKnob(h, K_AMOUNT, std::max(0, std::min(100, knobAim(K_AMOUNT) + d)));
         return 0;
     }
     case WM_COMMAND: {
         int id = LOWORD(w), code = HIWORD(w);
-        if ((code == CBN_DROPDOWN || code == CBN_CLOSEUP) && l) InvalidateRect((HWND)l, nullptr, FALSE);
+        if ((code == CBN_DROPDOWN || code == CBN_CLOSEUP) && l) faceChange((HWND)l, h, code == CBN_DROPDOWN);
+        if (code == CBN_CLOSEUP && l) PostMessageW(h, WM_FACE_FADE, 0, l);
+        if (code == CBN_DROPDOWN && l) {
+            if (const HWND list = dropListOf((HWND)l)) shineReset(list, (int)SendMessageW((HWND)l, CB_GETCURSEL, 0, 0));
+            dropArm((HWND)l);
+            PostMessageW(h, WM_FIT_DROP, 0, l);
+        }
         if (id == ID_MIC && code == CBN_SELCHANGE) {
             int i = (int)SendMessageW(hMic, CB_GETCURSEL, 0, 0);
             if (i >= 0 && i < (int)uiMics.size()) {
@@ -11906,6 +13736,10 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             fxFrame(h);
             return 0;
         }
+        if (w == ZOOM_TIMER) {
+            zoomStep(h);
+            return 0;
+        }
         if (w == GLIDE_TIMER) {
             glideStep(h);
             return 0;
@@ -11914,8 +13748,9 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (devSpinAt) invalidateDesign(h, R_DEV_REFRESH);
             meterTick();
             takeTick(h);
-            const RECT fadeIn = hotIn.r, fadeOut = hotOut.r;
-            if (hotFadeStep(16.0)) { invalidateDesign(h, fadeIn); invalidateDesign(h, fadeOut); }
+            const RECT fadeIn = hotIn.r, fadeOut = hotOut.r, pressed = hotPress.r;
+            if (hotFadeStep(16.0)) { invalidateDesign(h, fadeIn); invalidateDesign(h, fadeOut); invalidateDesign(h, pressed); }
+            if (licensed && !cablePanel && presetBarStep(16.0)) invalidateDesign(h, R_SB_ALL);
             ticksRepaint(h);
             if (licensed && !cablePanel) {
                 UpdateWindow(h);
@@ -11973,6 +13808,11 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_CLOSE:
+        if (zoomDrag) {
+            zoomDone(h);
+            ReleaseCapture();
+        }
+        zoomSettle(h);
         if (winFx.kind == FX_DOCK || winFx.kind == FX_UNDOCK) {
             KillTimer(h, FX_TIMER);
             winFx.kind = FX_NONE;
@@ -11985,6 +13825,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         break;
     case WM_SYSCOMMAND:
+        if ((w & 0xFFF0) == SC_MINIMIZE) zoomSettle(h);
         if ((w & 0xFFF0) == SC_MINIMIZE && uiAnim && IsWindowVisible(h) && !IsIconic(h) &&
             (winFx.kind == FX_NONE || winFx.kind == FX_OPEN || winFx.kind == FX_UNDOCK)) {
             if (!dockDown(h)) fxStart(h, FX_HIDE);
@@ -11992,6 +13833,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         break;
     case WM_SIZE:
+        if (w == SIZE_MINIMIZED) zoomPark(h);
         if (w == SIZE_MINIMIZED && uiAnim) {
             if (winFx.kind == FX_OPEN || winFx.kind == FX_HIDE) {
                 KillTimer(h, FX_TIMER);
@@ -12002,8 +13844,11 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             winFx.faded = true;
         } else if (w == SIZE_RESTORED && winFx.faded && winFx.kind != FX_CLOSE) {
             winFx.faded = false;
+            zoomUnpark(h);
             if (!uiAnim) applyWindowAlpha(h);
             else if (!dockUp(h)) fxStart(h, FX_OPEN);
+        } else if (w == SIZE_RESTORED) {
+            zoomUnpark(h);
         }
         break;
     case WM_EXITSIZEMOVE:
@@ -12027,6 +13872,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_DESTROY:
         dockDrop();
+        ghostClear();
         settingsFlush();
         presetTopKeep();
         g.quit = true;
