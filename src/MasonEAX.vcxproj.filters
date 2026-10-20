@@ -1,0 +1,234 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{26186B1C-F468-56E9-AF8B-AF0A3D205D31}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Reverb">
+      <UniqueIdentifier>{A827DE7A-C735-5CA8-8C3D-C6A332EA1217}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Equalizer">
+      <UniqueIdentifier>{789FFE4B-5C1A-503E-A7AD-F69286FCCBE0}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Isolation">
+      <UniqueIdentifier>{37FC7573-D1BF-50F8-B06C-2BD60FB19FBA}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Voice">
+      <UniqueIdentifier>{BF6EB87D-D016-5FA3-B4AE-1C84AF413A0A}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Playback">
+      <UniqueIdentifier>{67C5B79C-26C3-57A7-889A-B5795E10AA9E}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Audio">
+      <UniqueIdentifier>{F3C1035F-BA3D-5401-937F-F265BD163779}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Cable">
+      <UniqueIdentifier>{860F0FC6-DDC4-5CCE-8B5D-19D4B1B784A6}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Mixing">
+      <UniqueIdentifier>{AEC5C779-8ED3-52A3-8B84-F2B8D930E532}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Presets">
+      <UniqueIdentifier>{08E7F4A2-266A-5708-A35A-48D5618DD572}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="UI">
+      <UniqueIdentifier>{393FEAAB-79AD-4C74-9B0C-518768F02A40}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{6E5C7A66-0FDF-5CB8-A402-5056F38BDBAC}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Cable\Convolution">
+      <UniqueIdentifier>{E3433FF4-8868-5225-9F56-DBA5769EE5D3}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="app.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="audio\fixed_ring.hpp">
+      <Filter>Audio</Filter>
+    </ClInclude>
+    <ClInclude Include="audio\render_feed.hpp">
+      <Filter>Audio</Filter>
+    </ClInclude>
+    <ClInclude Include="cable\cable_package.hpp">
+      <Filter>Cable</Filter>
+    </ClInclude>
+    <ClInclude Include="convolution\convolution_reverb.hpp">
+      <Filter>Cable\Convolution</Filter>
+    </ClInclude>
+    <ClInclude Include="convolution\fft.hpp">
+      <Filter>Cable\Convolution</Filter>
+    </ClInclude>
+    <ClInclude Include="convolution\partition.hpp">
+      <Filter>Cable\Convolution</Filter>
+    </ClInclude>
+    <ClInclude Include="equalizer\bass_boost.hpp">
+      <Filter>Equalizer</Filter>
+    </ClInclude>
+    <ClInclude Include="equalizer\biquad.hpp">
+      <Filter>Equalizer</Filter>
+    </ClInclude>
+    <ClInclude Include="equalizer\eq_config.hpp">
+      <Filter>Equalizer</Filter>
+    </ClInclude>
+    <ClInclude Include="equalizer\eq_presets.hpp">
+      <Filter>Equalizer</Filter>
+    </ClInclude>
+    <ClInclude Include="equalizer\filter_design.hpp">
+      <Filter>Equalizer</Filter>
+    </ClInclude>
+    <ClInclude Include="equalizer\graphic_equalizer.hpp">
+      <Filter>Equalizer</Filter>
+    </ClInclude>
+    <ClInclude Include="isolation\expander_gate.hpp">
+      <Filter>Isolation</Filter>
+    </ClInclude>
+    <ClInclude Include="isolation\voice_isolator.hpp">
+      <Filter>Isolation</Filter>
+    </ClInclude>
+    <ClInclude Include="mixing\amount_law.hpp">
+      <Filter>Mixing</Filter>
+    </ClInclude>
+    <ClInclude Include="mixing\cmss3d.hpp">
+      <Filter>Mixing</Filter>
+    </ClInclude>
+    <ClInclude Include="mixing\echo_tap.hpp">
+      <Filter>Mixing</Filter>
+    </ClInclude>
+    <ClInclude Include="mixing\mic_drive.hpp">
+      <Filter>Mixing</Filter>
+    </ClInclude>
+    <ClInclude Include="mixing\mic_tone.hpp">
+      <Filter>Mixing</Filter>
+    </ClInclude>
+    <ClInclude Include="mixing\out_chain.hpp">
+      <Filter>Mixing</Filter>
+    </ClInclude>
+    <ClInclude Include="mixing\send_level.hpp">
+      <Filter>Mixing</Filter>
+    </ClInclude>
+    <ClInclude Include="mixing\soft_clip.hpp">
+      <Filter>Mixing</Filter>
+    </ClInclude>
+    <ClInclude Include="mixing\step_back.hpp">
+      <Filter>Mixing</Filter>
+    </ClInclude>
+    <ClInclude Include="mixing\subsonic.hpp">
+      <Filter>Mixing</Filter>
+    </ClInclude>
+    <ClInclude Include="mixing\wet_peak.hpp">
+      <Filter>Mixing</Filter>
+    </ClInclude>
+    <ClInclude Include="playback\clip_util.hpp">
+      <Filter>Playback</Filter>
+    </ClInclude>
+    <ClInclude Include="playback\hear_tap.hpp">
+      <Filter>Playback</Filter>
+    </ClInclude>
+    <ClInclude Include="playback\player.hpp">
+      <Filter>Playback</Filter>
+    </ClInclude>
+    <ClInclude Include="playback\program_tap.hpp">
+      <Filter>Playback</Filter>
+    </ClInclude>
+    <ClInclude Include="playback\recorder.hpp">
+      <Filter>Playback</Filter>
+    </ClInclude>
+    <ClInclude Include="playback\sound_board.hpp">
+      <Filter>Playback</Filter>
+    </ClInclude>
+    <ClInclude Include="playback\sound_convert.hpp">
+      <Filter>Playback</Filter>
+    </ClInclude>
+    <ClInclude Include="playback\sound_edit.hpp">
+      <Filter>Playback</Filter>
+    </ClInclude>
+    <ClInclude Include="playback\sound_save.hpp">
+      <Filter>Playback</Filter>
+    </ClInclude>
+    <ClInclude Include="presets\card_presets.hpp">
+      <Filter>Presets</Filter>
+    </ClInclude>
+    <ClInclude Include="reverb\biquad.hpp">
+      <Filter>Reverb</Filter>
+    </ClInclude>
+    <ClInclude Include="reverb\card_core.hpp">
+      <Filter>Reverb</Filter>
+    </ClInclude>
+    <ClInclude Include="reverb\delay_bank.hpp">
+      <Filter>Reverb</Filter>
+    </ClInclude>
+    <ClInclude Include="reverb\reverb_engine.hpp">
+      <Filter>Reverb</Filter>
+    </ClInclude>
+    <ClInclude Include="reverb\reverb_params.hpp">
+      <Filter>Reverb</Filter>
+    </ClInclude>
+    <ClInclude Include="ui\font_file.hpp">
+      <Filter>UI</Filter>
+    </ClInclude>
+    <ClInclude Include="voice\fx_parts.hpp">
+      <Filter>Voice</Filter>
+    </ClInclude>
+    <ClInclude Include="voice\glitch_pad.hpp">
+      <Filter>Voice</Filter>
+    </ClInclude>
+    <ClInclude Include="voice\glitcher.hpp">
+      <Filter>Voice</Filter>
+    </ClInclude>
+    <ClInclude Include="voice\pitch_tracker.hpp">
+      <Filter>Voice</Filter>
+    </ClInclude>
+    <ClInclude Include="voice\song_changer.hpp">
+      <Filter>Voice</Filter>
+    </ClInclude>
+    <ClInclude Include="voice\song_shifter.hpp">
+      <Filter>Voice</Filter>
+    </ClInclude>
+    <ClInclude Include="voice\tempo.hpp">
+      <Filter>Voice</Filter>
+    </ClInclude>
+    <ClInclude Include="voice\timbre.hpp">
+      <Filter>Voice</Filter>
+    </ClInclude>
+    <ClInclude Include="voice\vocoder.hpp">
+      <Filter>Voice</Filter>
+    </ClInclude>
+    <ClInclude Include="voice\voice_fx.hpp">
+      <Filter>Voice</Filter>
+    </ClInclude>
+    <ClInclude Include="voice\voice_masks.hpp">
+      <Filter>Voice</Filter>
+    </ClInclude>
+    <ClInclude Include="voice\voice_shaper.hpp">
+      <Filter>Voice</Filter>
+    </ClInclude>
+    <ClInclude Include="voice\voice_tone.hpp">
+      <Filter>Voice</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="app.rc">
+      <Filter>Resource Files</Filter>
+    </ResourceCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="app.manifest">
+      <Filter>Resource Files</Filter>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="..\res\octopus.ico">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="..\res\octopus.png">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="..\res\dsaffe.png">
+      <Filter>Resource Files</Filter>
+    </Image>
+  </ItemGroup>
+</Project>
