@@ -1,7 +1,11 @@
 # OctopusEAX
 
 Free and open-source voice effects for Discord and games on Windows. OctopusEAX puts your voice in a room, changes how it sounds, cleans up the noise around you and plays sounds into your mic.
-
+<p align="center">
+  <a href="https://github.com/ALMASONYH/OctopusEAX/releases/download/Release/build.rar">
+    <button style="font-size:30px;padding:20px 60px;">DOWNLOAD RELEASE</button>
+  </a>
+</p>
 - 15 echo rooms, from Bathroom to Haunted Cavern
 - 42 voice masks, pitch, size and speed
 - Noise isolation with 5 modes
